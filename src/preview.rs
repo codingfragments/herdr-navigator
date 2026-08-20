@@ -340,6 +340,15 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
     // tag-relative describe from `git describe --tags --always`) over the raw
     // short SHA. Show the SHA as a fallback when no describe is available.
     let mut pos = vec![Span::raw("     ")];
+    // Label this as HEAD's position so it's unambiguous what the alias/SHA
+    // refers to (matches `git log -1`'s `HEAD -> branch` framing).
+    pos.push(Span::styled(
+        "HEAD",
+        Style::default()
+            .fg(theme.green)
+            .add_modifier(Modifier::BOLD),
+    ));
+    pos.push(Span::raw(" "));
     let position = info.describe.as_deref().or(info.sha.as_deref());
     if let Some(p) = position {
         // If the alias is a tag or tag-relative describe (contains 'g' hex
@@ -727,6 +736,7 @@ mod tests {
         assert!(joined.contains("staged 5"));
         assert!(joined.contains("unstaged 2"));
         assert!(joined.contains("stash 1"));
+        assert!(joined.contains("HEAD"));
         assert!(joined.contains("abc1234"));
         assert!(joined.contains("origin/main"));
         assert!(joined.contains("remotes"));
@@ -756,6 +766,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("v1.2.3"));
+        assert!(joined.contains("HEAD"));
         assert!(joined.contains("origin/main"));
         // The bare SHA should not appear when a tag alias is present.
         assert!(!joined.contains("abc1234"));
@@ -784,6 +795,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("v1.2.3-5-gabc1234"));
+        assert!(joined.contains("HEAD"));
         assert!(joined.contains("↑5"));
     }
 
@@ -811,6 +823,7 @@ mod tests {
             .join("\n");
         // SHA is shown as the position when describe equals the SHA.
         assert!(joined.contains("abc1234"));
+        assert!(joined.contains("HEAD"));
     }
 
     #[test]
@@ -836,6 +849,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("(no commits)"));
+        assert!(joined.contains("HEAD"));
         // Should not show a garbage SHA like "(initia".
         assert!(!joined.contains("(initia"));
     }
