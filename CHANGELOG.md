@@ -5,6 +5,7 @@ All notable changes to this project are documented here.
 ## [Unreleased]
 
 ### Added
+- Workspace tree expansion in the list. `→` expands a selected workspace to show its tabs, `Space` toggles expand/collapse, and `←` collapses. Expanded tabs show their panes. Tabs and panes are jump targets (`herdr tab focus` / `herdr pane focus`). The tree only applies to the unfiltered view; typing a query collapses to flat fuzzy search. Children are fetched lazily via `herdr tab list` / `herdr pane list` on expansion.
 - `PageUp` / `PageDown` move the selection by one visible page in addition to `Up` / `Down`.
 - `herdr-navigator.open-popup` action and `picker-popup` pane open the picker as a centered 80% × 80% popup over the focused workspace instead of a full-screen overlay. Transient like the overlay (closes on `Enter`/`Esc`) and launch-or-focus within the focused workspace.
 - Navigator-specific `[theme].name` and `[theme.custom]` overrides. Navigator layers inherited Herdr custom tokens beneath its own custom tokens ([#20](https://github.com/thanhdat77/herdr-navigator/issues/20)).

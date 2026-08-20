@@ -39,6 +39,7 @@ pub(crate) fn collect_projects() -> Vec<Entry> {
             action: EntryAction::OpenProject,
             source_label: None,
             search_terms: vec![],
+            parent_id: None,
             canonical: OnceLock::new(),
         });
     }
@@ -85,6 +86,7 @@ pub(crate) fn quick_actions_entry() -> Entry {
         },
         source_label: None,
         search_terms: vec![],
+        parent_id: None,
         canonical: OnceLock::new(),
     }
 }

@@ -15,6 +15,10 @@ pub(crate) enum Source {
     Session,
     QuickAction,
     Integration,
+    /// A tab within an expanded workspace (tree child, not a top-level source).
+    Tab,
+    /// A pane within an expanded tab (tree child, not a top-level source).
+    Pane,
 }
 
 impl Source {
@@ -29,6 +33,8 @@ impl Source {
             Source::Session => "session",
             Source::QuickAction => "quick",
             Source::Integration => "plugin",
+            Source::Tab => "tab",
+            Source::Pane => "panes",
         }
     }
 
@@ -71,6 +77,12 @@ pub(crate) enum EntryAction {
     },
     FocusAgent {
         target: String,
+    },
+    FocusTab {
+        id: String,
+    },
+    FocusPane {
+        id: String,
     },
     OpenProject,
     OpenRemote {
@@ -121,6 +133,9 @@ pub(crate) struct Entry {
     pub(crate) action: EntryAction,
     pub(crate) source_label: Option<String>,
     pub(crate) search_terms: Vec<String>,
+    /// Parent workspace/tab id for tree children (tabs/panes). `None` for
+    /// top-level entries.
+    pub(crate) parent_id: Option<String>,
     /// Lazily resolved `key()`. `canonicalize` is a syscall and `key()` sits on
     /// hot paths (filtering, sorting, pin lookups, rendering), so resolve once.
     pub(crate) canonical: OnceLock<String>,
@@ -221,6 +236,7 @@ mod tests {
             action: EntryAction::FocusOrCreateDir,
             source_label: None,
             search_terms: vec![],
+            parent_id: None,
             canonical: OnceLock::new(),
         }
     }

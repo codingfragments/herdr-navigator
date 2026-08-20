@@ -50,6 +50,14 @@ pub(crate) struct App {
     pub(crate) spinner_tick: u32,
     pub(crate) update_available: Option<String>,
     pub(crate) list_height: u16,
+    /// Tree child entries (tabs/panes) fetched when a workspace/tab is expanded.
+    /// Indexed by `filtered` values >= `entries.len()`.
+    pub(crate) child_entries: Vec<Entry>,
+    /// Expanded workspace/tab IDs in the tree view.
+    pub(crate) expanded: std::collections::HashSet<String>,
+    /// Whether flat search entries (all panes) have been fetched for the
+    /// current search session. Cleared when the query is emptied.
+    pub(crate) search_fetched: bool,
 }
 
 impl App {
@@ -73,10 +81,18 @@ impl App {
             spinner_tick: 0,
             update_available: None,
             list_height: 0,
+            child_entries: vec![],
+            expanded: std::collections::HashSet::new(),
+            search_fetched: false,
         }
     }
 
     pub(crate) fn refresh(&mut self) {
+        // Workspaces/tabs/panes may have changed; clear tree children and
+        // expansion state so stale children are never shown.
+        self.child_entries.clear();
+        self.expanded.clear();
+        self.search_fetched = false;
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
         let (workspace_entries, path_to_workspaces, migrated_legacy, has_live_workspace_list) =
@@ -151,6 +167,21 @@ impl App {
     pub(crate) fn apply_filter(&mut self) {
         let query = Query::parse(&self.query);
         let empty_query = query.plain.is_empty();
+        let search_mode = !empty_query || self.source_filter.is_some();
+
+        // Transition between tree and search modes.
+        if search_mode && !self.search_fetched {
+            // Entering search mode: replace tree children with flat pane entries.
+            self.child_entries.clear();
+            self.fetch_all_panes_for_search();
+            self.search_fetched = true;
+        } else if !search_mode && self.search_fetched {
+            // Leaving search mode: clear flat entries, re-fetch expanded children.
+            self.child_entries.clear();
+            self.search_fetched = false;
+            self.refetch_expanded_children();
+        }
+
         let agent_view =
             query.all_agents || (self.source_filter == Some(Source::Agent) && empty_query);
         let use_agent_priority = empty_query
@@ -160,38 +191,65 @@ impl App {
             && self.config.jump_back.pin_previous
             && self.query.trim().is_empty()
             && self.source_filter.is_none();
-        // Everything the comparator needs is resolved here, once per candidate.
-        // Deriving it inside `sort_by` instead costs O(n log n) pin lookups, and
-        // a pin lookup canonicalizes a path.
         let mut scorer = Scorer::new(&self.config.picker.engine, &query.plain);
         let mut scored: Vec<Candidate> = Vec::new();
+
+        let score_entry =
+            |e: &Entry, _idx: usize, scorer: &mut Scorer| -> Option<(i64, bool, bool, usize)> {
+                if let Some(sf) = &self.source_filter {
+                    if &e.source != sf {
+                        return None;
+                    }
+                }
+                if !query.filters_match(e) {
+                    return None;
+                }
+                let bonus = self.config.picker.source_bonus(&e.source)
+                    + query.score_bonus(e, use_agent_priority);
+                let score = if query.plain.is_empty() {
+                    bonus
+                } else if let Some(score) = scorer.score(&e.haystack()) {
+                    score + bonus
+                } else {
+                    return None;
+                };
+                Some((
+                    score,
+                    pin_previous
+                        && e.source == Source::Workspace
+                        && e.workspace_id.as_deref() == self.previous_workspace_id.as_deref(),
+                    self.is_pinned(e),
+                    self.config.picker.source_rank(&e.source),
+                ))
+            };
+
         for (idx, e) in self.entries.iter().enumerate() {
-            if let Some(sf) = &self.source_filter {
-                if &e.source != sf {
-                    continue;
+            if let Some((score, prev, pinned, rank)) = score_entry(e, idx, &mut scorer) {
+                scored.push(Candidate {
+                    previous_pinned: prev,
+                    user_pinned: pinned,
+                    score,
+                    source_rank: rank,
+                    idx,
+                });
+            }
+        }
+        // In search mode, also score flat pane entries from child_entries.
+        if search_mode {
+            let entries_len = self.entries.len();
+            for (ci, e) in self.child_entries.iter().enumerate() {
+                if let Some((score, _, pinned, rank)) =
+                    score_entry(e, entries_len + ci, &mut scorer)
+                {
+                    scored.push(Candidate {
+                        previous_pinned: false,
+                        user_pinned: pinned,
+                        score,
+                        source_rank: rank,
+                        idx: entries_len + ci,
+                    });
                 }
             }
-            if !query.filters_match(e) {
-                continue;
-            }
-            let bonus = self.config.picker.source_bonus(&e.source)
-                + query.score_bonus(e, use_agent_priority);
-            let score = if query.plain.is_empty() {
-                bonus
-            } else if let Some(score) = scorer.score(&e.haystack()) {
-                score + bonus
-            } else {
-                continue;
-            };
-            scored.push(Candidate {
-                previous_pinned: pin_previous
-                    && e.source == Source::Workspace
-                    && e.workspace_id.as_deref() == self.previous_workspace_id.as_deref(),
-                user_pinned: self.is_pinned(e),
-                score,
-                source_rank: self.config.picker.source_rank(&e.source),
-                idx,
-            });
         }
         scored.sort_by(|a, b| {
             b.previous_pinned
@@ -206,6 +264,409 @@ impl App {
         self.filtered = filtered;
         self.filtered_scores = scores;
         self.selected = 0;
+
+        // When the view is unfiltered (tree mode), interleave expanded children.
+        if !search_mode {
+            self.interleave_children();
+        }
+    }
+
+    /// Insert tree children (tabs/panes) into `filtered` after their expanded
+    /// parents, recursively so expanded tabs get their panes too. Children
+    /// are stored in `child_entries`; their filtered index is
+    /// `entries.len() + child_index`.
+    fn interleave_children(&mut self) {
+        if self.expanded.is_empty() || self.filtered.is_empty() {
+            return;
+        }
+        let entries_len = self.entries.len();
+        let mut new_filtered = Vec::with_capacity(self.filtered.len());
+        let mut new_scores = Vec::with_capacity(self.filtered.len());
+        // Recursive walk: for each entry in the base list, push it, then if
+        // expanded, push its children (and recurse into each child).
+        fn walk(
+            idx: usize,
+            score: i64,
+            app: &App,
+            entries_len: usize,
+            out: &mut Vec<usize>,
+            scores: &mut Vec<i64>,
+        ) {
+            out.push(idx);
+            scores.push(score);
+            let Some(entry) = app.get_entry(idx) else {
+                return;
+            };
+            let (expand_key, parent_id) = match &entry.action {
+                EntryAction::FocusWorkspace { id } => (format!("ws:{id}"), Some(id.clone())),
+                EntryAction::FocusTab { id } => (format!("tab:{id}"), Some(id.clone())),
+                _ => return,
+            };
+            if !app.expanded.contains(&expand_key) {
+                return;
+            }
+            let Some(parent_id) = parent_id else {
+                return;
+            };
+            for (ci, child) in app.child_entries.iter().enumerate() {
+                if child.parent_id.as_deref() == Some(&parent_id) {
+                    walk(entries_len + ci, 0, app, entries_len, out, scores);
+                }
+            }
+        }
+        for (i, &idx) in self.filtered.iter().enumerate() {
+            let score = self.filtered_scores.get(i).copied().unwrap_or(0);
+            walk(
+                idx,
+                score,
+                self,
+                entries_len,
+                &mut new_filtered,
+                &mut new_scores,
+            );
+        }
+        self.filtered = new_filtered;
+        self.filtered_scores = new_scores;
+    }
+
+    /// Fetch tabs for a workspace and add them to `child_entries`.
+    fn fetch_tabs(&mut self, workspace_id: &str) {
+        let json = crate::herdr::herdr_json(["tab", "list", "--workspace", workspace_id])
+            .unwrap_or(serde_json::Value::Null);
+        let Some(tabs) = json.pointer("/result/tabs").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for t in tabs {
+            let tab_id = t.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let focused = t.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+            let pane_count = t.get("pane_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let status = t
+                .get("agent_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let title = if label.is_empty() {
+                format!("tab {}", tab_id)
+            } else {
+                label.to_string()
+            };
+            let prefix: String = if focused {
+                "focused · ".into()
+            } else if status != "unknown" {
+                format!("{status} · ")
+            } else {
+                String::new()
+            };
+            let subtitle = format!("{prefix}{pane_count} panes");
+            self.child_entries.push(Entry {
+                source: Source::Tab,
+                title,
+                subtitle,
+                path: std::path::PathBuf::new(),
+                workspace_id: Some(workspace_id.into()),
+                workspace_label: None,
+                agent_target: None,
+                project: None,
+                action: EntryAction::FocusTab { id: tab_id.into() },
+                source_label: None,
+                search_terms: vec![tab_id.into(), label.into()],
+                parent_id: Some(workspace_id.into()),
+                canonical: std::sync::OnceLock::new(),
+            });
+        }
+    }
+
+    /// Fetch panes for a tab and add them to `child_entries`.
+    fn fetch_panes(&mut self, workspace_id: &str, tab_id: &str) {
+        let json = crate::herdr::herdr_json(["pane", "list", "--workspace", workspace_id])
+            .unwrap_or(serde_json::Value::Null);
+        let Some(panes) = json.pointer("/result/panes").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for p in panes {
+            let pane_tab = p.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+            if pane_tab != tab_id {
+                continue;
+            }
+            let pane_id = p.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let focused = p.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+            let cwd = p.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+            let agent = p.get("agent").and_then(|v| v.as_str());
+            let title = if let Some(a) = agent {
+                a.to_string()
+            } else if !label.is_empty() {
+                label.to_string()
+            } else {
+                pane_id.to_string()
+            };
+            let subtitle = format!(
+                "{}{}{}",
+                if focused { "focused · " } else { "" },
+                if !cwd.is_empty() {
+                    format!("{cwd} · ")
+                } else {
+                    String::new()
+                },
+                pane_id
+            );
+            self.child_entries.push(Entry {
+                source: Source::Pane,
+                title,
+                subtitle,
+                path: std::path::PathBuf::from(cwd),
+                workspace_id: Some(workspace_id.into()),
+                workspace_label: None,
+                agent_target: Some(pane_id.into()),
+                project: None,
+                action: EntryAction::FocusPane { id: pane_id.into() },
+                source_label: None,
+                search_terms: vec![pane_id.into(), label.into(), cwd.into()],
+                parent_id: Some(tab_id.into()),
+                canonical: std::sync::OnceLock::new(),
+            });
+        }
+    }
+
+    /// Re-apply the filter while preserving the current selection. Used by
+    /// expand/collapse so the cursor doesn't jump to the top of the list.
+    fn reapply_filter_preserving_selection(&mut self) {
+        let selected_key = self
+            .filtered
+            .get(self.selected)
+            .and_then(|&idx| self.get_entry(idx))
+            .map(entry_identity_key);
+        self.apply_filter();
+        if let Some(key) = selected_key {
+            self.selected = self
+                .filtered
+                .iter()
+                .position(|&idx| {
+                    self.get_entry(idx)
+                        .map(|e| entry_identity_key(e) == key)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0);
+        }
+    }
+
+    /// Fetch all tabs and panes for every open workspace, as flat single-line
+    /// pane entries for search mode. Each pane's title is
+    /// `ws_label / tab_label / pane_name` so it reads as a single searchable line.
+    fn fetch_all_panes_for_search(&mut self) {
+        use std::collections::HashMap;
+        for ws in &self.entries {
+            if ws.source != Source::Workspace {
+                continue;
+            }
+            let ws_id = match &ws.action {
+                EntryAction::FocusWorkspace { id } => id.clone(),
+                _ => continue,
+            };
+            let ws_label = ws.title.clone();
+
+            // Fetch tabs (one call per workspace).
+            let tab_json = crate::herdr::herdr_json(["tab", "list", "--workspace", &ws_id])
+                .unwrap_or(serde_json::Value::Null);
+            let tab_labels: HashMap<String, String> = tab_json
+                .pointer("/result/tabs")
+                .and_then(|v| v.as_array())
+                .map(|tabs| {
+                    tabs.iter()
+                        .filter_map(|t| {
+                            let id = t.get("tab_id")?.as_str()?.to_string();
+                            let label = t
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&id)
+                                .to_string();
+                            Some((id, label))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Fetch panes (one call per workspace).
+            let pane_json = crate::herdr::herdr_json(["pane", "list", "--workspace", &ws_id])
+                .unwrap_or(serde_json::Value::Null);
+            let Some(panes) = pane_json
+                .pointer("/result/panes")
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            for p in panes {
+                let pane_id = p.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_id = p.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_label = tab_labels
+                    .get(tab_id)
+                    .cloned()
+                    .unwrap_or_else(|| tab_id.to_string());
+                let pane_label = p.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                let agent = p.get("agent").and_then(|v| v.as_str());
+                let cwd = p.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                let focused = p.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+                let pane_name = agent
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        if !pane_label.is_empty() {
+                            Some(pane_label.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| pane_id.to_string());
+                let title = format!("{ws_label} / {tab_label} / {pane_name}");
+                let subtitle = format!(
+                    "{}{}({})",
+                    if focused { "focused · " } else { "" },
+                    if !cwd.is_empty() {
+                        format!("{cwd} · ")
+                    } else {
+                        String::new()
+                    },
+                    pane_id
+                );
+                self.child_entries.push(Entry {
+                    source: Source::Pane,
+                    title,
+                    subtitle,
+                    path: std::path::PathBuf::from(cwd),
+                    workspace_id: Some(ws_id.clone()),
+                    workspace_label: None,
+                    agent_target: Some(pane_id.into()),
+                    project: None,
+                    action: EntryAction::FocusPane { id: pane_id.into() },
+                    source_label: None,
+                    search_terms: vec![
+                        ws_label.clone(),
+                        tab_label.clone(),
+                        pane_name.clone(),
+                        pane_id.into(),
+                        cwd.into(),
+                    ],
+                    parent_id: None,
+                    canonical: std::sync::OnceLock::new(),
+                });
+            }
+        }
+    }
+
+    /// Re-fetch tree children for all expanded workspaces/tabs. Called when
+    /// leaving search mode to restore the tree view.
+    fn refetch_expanded_children(&mut self) {
+        let expanded: Vec<String> = self.expanded.iter().cloned().collect();
+        for key in &expanded {
+            if let Some(ws_id) = key.strip_prefix("ws:") {
+                self.fetch_tabs(ws_id);
+            } else if let Some(tab_id) = key.strip_prefix("tab:") {
+                // We need the workspace_id for the tab; find it from entries.
+                let ws_id = self.entries.iter().find_map(|e| {
+                    if e.source == Source::Workspace {
+                        e.workspace_id.clone()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ws_id) = ws_id {
+                    self.fetch_panes(&ws_id, tab_id);
+                }
+            }
+        }
+    }
+
+    /// Expand the selected workspace or tab entry, fetching children if needed.
+    pub(crate) fn expand_selected(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        let (key, workspace_id, tab_id) = match &entry.action {
+            EntryAction::FocusWorkspace { id } => (format!("ws:{id}"), Some(id.clone()), None),
+            EntryAction::FocusTab { id } => (
+                format!("tab:{id}"),
+                entry.workspace_id.clone(),
+                Some(id.clone()),
+            ),
+            _ => return,
+        };
+        if self.expanded.insert(key) {
+            // Fetch children if not already present.
+            let parent_id = match &entry.action {
+                EntryAction::FocusWorkspace { id } => id.clone(),
+                EntryAction::FocusTab { id } => id.clone(),
+                _ => return,
+            };
+            let already = self
+                .child_entries
+                .iter()
+                .any(|c| c.parent_id.as_deref() == Some(&parent_id));
+            if !already {
+                if let Some(tab_id) = tab_id {
+                    if let Some(ws_id) = &workspace_id {
+                        self.fetch_panes(ws_id, &tab_id);
+                    }
+                } else if let Some(ws_id) = &workspace_id {
+                    self.fetch_tabs(ws_id);
+                }
+            }
+            self.reapply_filter_preserving_selection();
+        }
+    }
+
+    /// Collapse the selected workspace or tab entry.
+    pub(crate) fn collapse_selected(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        let key = match &entry.action {
+            EntryAction::FocusWorkspace { id } => format!("ws:{id}"),
+            EntryAction::FocusTab { id } => format!("tab:{id}"),
+            _ => return,
+        };
+        if self.expanded.remove(&key) {
+            self.reapply_filter_preserving_selection();
+        }
+    }
+
+    /// Toggle expansion of the selected workspace or tab.
+    pub(crate) fn toggle_expand_selected(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        let key = match &entry.action {
+            EntryAction::FocusWorkspace { id } => format!("ws:{id}"),
+            EntryAction::FocusTab { id } => format!("tab:{id}"),
+            _ => return,
+        };
+        if self.expanded.contains(&key) {
+            self.collapse_selected();
+        } else {
+            self.expand_selected();
+        }
+    }
+
+    /// Whether the selected entry is expandable (workspace or tab).
+    pub(crate) fn selected_is_expandable(&self) -> bool {
+        self.selected_entry().is_some_and(|e| {
+            matches!(
+                e.action,
+                EntryAction::FocusWorkspace { .. } | EntryAction::FocusTab { .. }
+            )
+        })
+    }
+
+    /// Whether the selected entry is currently expanded.
+    pub(crate) fn selected_is_expanded(&self) -> bool {
+        let Some(entry) = self.selected_entry() else {
+            return false;
+        };
+        let key = match &entry.action {
+            EntryAction::FocusWorkspace { id } => format!("ws:{id}"),
+            EntryAction::FocusTab { id } => format!("tab:{id}"),
+            _ => return false,
+        };
+        self.expanded.contains(&key)
     }
 
     /// Drop the trailing word of the query, plus any whitespace before it.
@@ -271,10 +732,20 @@ impl App {
     pub(crate) fn page_up(&mut self) {
         self.selected = self.selected.saturating_sub(self.page_size());
     }
+    /// Resolve a filtered index to an entry. Indices < `entries.len()` map to
+    /// top-level entries; indices >= `entries.len()` map to tree children.
+    pub(crate) fn get_entry(&self, idx: usize) -> Option<&Entry> {
+        if idx < self.entries.len() {
+            self.entries.get(idx)
+        } else {
+            self.child_entries.get(idx - self.entries.len())
+        }
+    }
+
     pub(crate) fn selected_entry(&self) -> Option<&Entry> {
         self.filtered
             .get(self.selected)
-            .and_then(|idx| self.entries.get(*idx))
+            .and_then(|&idx| self.get_entry(idx))
     }
 
     pub(crate) fn is_pinned(&self, entry: &Entry) -> bool {
@@ -321,6 +792,8 @@ impl App {
                 &e.action,
                 EntryAction::FocusAgent { .. }
                     | EntryAction::FocusWorkspace { .. }
+                    | EntryAction::FocusTab { .. }
+                    | EntryAction::FocusPane { .. }
                     | EntryAction::OpenProject
                     | EntryAction::FocusOrCreateDir
             );
@@ -336,6 +809,8 @@ impl App {
             EntryAction::FocusWorkspace { id } => {
                 (run_herdr(["workspace", "focus", id]), true, true)
             }
+            EntryAction::FocusTab { id } => (run_herdr(["tab", "focus", id]), true, true),
+            EntryAction::FocusPane { id } => (run_herdr(["pane", "focus", id]), true, true),
             EntryAction::OpenProject => (self.open_project(&e), true, true),
             EntryAction::OpenRemote { target } => (sessions::open_remote(target), false, true),
             EntryAction::AttachSession { name, .. } => {
@@ -425,6 +900,7 @@ impl App {
             Source::Project => self.matching_project_workspace(e).map(|ws| ws.id.clone()),
             Source::Zoxide | Source::Root => self.matching_dir_workspace(e).map(|ws| ws.id.clone()),
             Source::Server | Source::Session | Source::QuickAction | Source::Integration => None,
+            Source::Tab | Source::Pane => None,
         }
     }
 
@@ -870,10 +1346,37 @@ fn herdr_agent_panel_sort() -> String {
         .unwrap_or_else(|| "spaces".into())
 }
 
+/// A stable identity for an entry, used to preserve selection across
+/// filter rebuilds (expansion/collapse). Distinct from `pin_key` which is
+/// for user pins; this includes the source so a workspace and a tab child
+/// with the same id don't collide.
+fn entry_identity_key(entry: &Entry) -> String {
+    match &entry.action {
+        EntryAction::FocusWorkspace { id } => format!("workspace:{id}"),
+        EntryAction::FocusAgent { target } => format!("agent:{target}"),
+        EntryAction::FocusTab { id } => format!("tab:{id}"),
+        EntryAction::FocusPane { id } => format!("pane:{id}"),
+        EntryAction::OpenProject => format!("project:{}", entry.key()),
+        EntryAction::OpenRemote { target } => format!("remote:{target}"),
+        EntryAction::AttachSession { name, remote } => {
+            format!("session:{}:{name}", remote.as_deref().unwrap_or("local"))
+        }
+        EntryAction::InvokePluginAction { action } => {
+            format!("plugin:{}:{action}", entry.source_name())
+        }
+        EntryAction::FocusOrCreateDir => format!("{}:{}", entry.source_name(), entry.key()),
+        EntryAction::RunCommand { command, .. } => {
+            format!("{}:{command}", entry.source_name())
+        }
+    }
+}
+
 fn pin_key(entry: &Entry) -> String {
     match &entry.action {
         EntryAction::FocusWorkspace { id } => format!("workspace:{id}"),
         EntryAction::FocusAgent { target } => format!("agent:{target}"),
+        EntryAction::FocusTab { id } => format!("tab:{id}"),
+        EntryAction::FocusPane { id } => format!("pane:{id}"),
         EntryAction::OpenProject => format!("project:{}", entry.key()),
         EntryAction::OpenRemote { target } => format!("remote:{target}"),
         EntryAction::AttachSession { name, remote } => {
@@ -930,6 +1433,7 @@ mod tests {
             action: EntryAction::FocusOrCreateDir,
             source_label: None,
             search_terms: vec![],
+            parent_id: None,
             canonical: OnceLock::new(),
         }
     }
@@ -985,6 +1489,7 @@ mod tests {
             },
             source_label: None,
             search_terms: vec!["main ai dot".into()],
+            parent_id: None,
             canonical: OnceLock::new(),
         }
     }
@@ -1036,7 +1541,7 @@ mod tests {
         ];
         app.apply_filter();
 
-        let first = &app.entries[app.filtered[0]];
+        let first = app.get_entry(app.filtered[0]).unwrap();
         assert!(first.subtitle.starts_with("done"));
     }
 
@@ -1123,6 +1628,200 @@ mod tests {
         assert_eq!(app.selected, 0);
         app.page_up();
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn expand_and_collapse_workspace_toggles_expanded_set() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        ws.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        app.entries = vec![ws];
+        app.apply_filter();
+
+        // Not expanded initially.
+        assert!(!app.selected_is_expanded());
+        assert!(app.selected_is_expandable());
+
+        // Expand — adds to expanded set (no Herdr call since we test state only).
+        app.expanded.insert("ws:w1".to_string());
+        assert!(app.selected_is_expanded());
+
+        // Collapse — removes from expanded set.
+        app.expanded.remove("ws:w1");
+        assert!(!app.selected_is_expanded());
+    }
+
+    #[test]
+    fn interleave_children_inserts_tabs_after_expanded_workspace() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        ws.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        app.entries = vec![ws];
+        app.apply_filter();
+
+        // Manually add a tab child (simulating fetch_tabs).
+        app.child_entries.push(Entry {
+            source: Source::Tab,
+            title: "main".into(),
+            subtitle: "1 panes".into(),
+            path: PathBuf::new(),
+            workspace_id: Some("w1".into()),
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusTab { id: "w1:t1".into() },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1".into()),
+            canonical: OnceLock::new(),
+        });
+
+        // Without expansion, filtered is just the workspace.
+        assert_eq!(app.filtered.len(), 1);
+
+        // Expand and re-apply filter.
+        app.expanded.insert("ws:w1".to_string());
+        app.apply_filter();
+        // Workspace + 1 tab child.
+        assert_eq!(app.filtered.len(), 2);
+        // The second entry should be the tab child.
+        let child = app.get_entry(app.filtered[1]).unwrap();
+        assert_eq!(child.source, Source::Tab);
+        assert_eq!(child.title, "main");
+    }
+
+    #[test]
+    fn search_mode_switches_to_flat_and_clears_tree_children() {
+        // Use a Zoxide entry (not a Workspace) so fetch_all_panes_for_search
+        // has nothing to fetch and no subprocess calls are made. This avoids
+        // test isolation issues with HERDR_BIN_PATH in parallel tests.
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let z = entry(Source::Zoxide, "/tmp", "x");
+        app.entries = vec![z];
+        app.apply_filter();
+
+        // Manually add a tree child (simulating expansion).
+        app.child_entries.push(Entry {
+            source: Source::Tab,
+            title: "main".into(),
+            subtitle: String::new(),
+            path: PathBuf::new(),
+            workspace_id: None,
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusTab { id: "w1:t1".into() },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1".into()),
+            canonical: OnceLock::new(),
+        });
+        app.expanded.insert("ws:w1".to_string());
+
+        // With a query, search mode is entered: tree children are cleared and
+        // flat search entries replace them. Since there are no workspaces,
+        // fetch_all_panes_for_search adds nothing.
+        app.query = "x".into();
+        app.apply_filter();
+        assert!(app.search_fetched);
+        // Tree children were cleared.
+        assert!(app.child_entries.is_empty());
+        // Only the zoxide entry matches.
+        assert_eq!(app.filtered.len(), 1);
+
+        // Clearing the query exits search mode.
+        app.query.clear();
+        app.apply_filter();
+        assert!(!app.search_fetched);
+    }
+
+    #[test]
+    fn expand_preserves_current_selection() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws1 = entry(Source::Workspace, "/a", "alpha");
+        ws1.workspace_id = Some("w1".into());
+        ws1.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        let mut ws2 = entry(Source::Workspace, "/b", "bravo");
+        ws2.workspace_id = Some("w2".into());
+        ws2.action = EntryAction::FocusWorkspace { id: "w2".into() };
+        app.entries = vec![ws1, ws2];
+        app.apply_filter();
+
+        // Select the second workspace.
+        app.selected = 1;
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+
+        // Expand it by setting the expanded state directly (avoids subprocess
+        // calls to herdr that would break test isolation with parallel tests).
+        app.expanded.insert("ws:w2".to_string());
+        app.reapply_filter_preserving_selection();
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+        assert!(app.selected_is_expanded());
+
+        // Collapse — selection still stays on bravo.
+        app.collapse_selected();
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+        assert!(!app.selected_is_expanded());
+    }
+
+    #[test]
+    fn interleave_children_recurses_into_expanded_tabs() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        ws.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        app.entries = vec![ws];
+        app.apply_filter();
+
+        // Add a tab child and a pane child (simulating fetch).
+        app.child_entries.push(Entry {
+            source: Source::Tab,
+            title: "main".into(),
+            subtitle: String::new(),
+            path: PathBuf::new(),
+            workspace_id: Some("w1".into()),
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusTab { id: "w1:t1".into() },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1".into()),
+            canonical: OnceLock::new(),
+        });
+        app.child_entries.push(Entry {
+            source: Source::Pane,
+            title: "shell".into(),
+            subtitle: String::new(),
+            path: PathBuf::new(),
+            workspace_id: Some("w1".into()),
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusPane {
+                id: "w1:t1:p1".into(),
+            },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1:t1".into()),
+            canonical: OnceLock::new(),
+        });
+
+        // Expand both the workspace and its tab.
+        app.expanded.insert("ws:w1".to_string());
+        app.expanded.insert("tab:w1:t1".to_string());
+        app.apply_filter();
+
+        // Should see: workspace, tab, pane (3 entries).
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(
+            app.get_entry(app.filtered[0]).unwrap().source,
+            Source::Workspace
+        );
+        assert_eq!(app.get_entry(app.filtered[1]).unwrap().source, Source::Tab);
+        assert_eq!(app.get_entry(app.filtered[2]).unwrap().source, Source::Pane);
     }
 
     #[test]

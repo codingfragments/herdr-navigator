@@ -252,6 +252,18 @@ fn execute_command(app: &mut App, command: Command, key: KeyEvent) -> Action {
             app.page_down();
             Action::Continue
         }
+        Command::Expand => {
+            app.expand_selected();
+            Action::Continue
+        }
+        Command::Collapse => {
+            app.collapse_selected();
+            Action::Continue
+        }
+        Command::ToggleExpand => {
+            app.toggle_expand_selected();
+            Action::Continue
+        }
         Command::StartSearch => {
             app.query.clear();
             app.apply_filter();
@@ -633,7 +645,48 @@ fn truncate_end(value: &str, max_chars: usize) -> String {
 }
 
 fn entry_branch(app: &App, entry: &Entry, group_end: bool) -> (&'static str, Color) {
+    // Tree children get indented tree markers.
+    if entry.source == Source::Tab {
+        let key = match &entry.action {
+            EntryAction::FocusTab { id } => format!("tab:{id}"),
+            _ => String::new(),
+        };
+        let expanded = app.expanded.contains(&key);
+        let glyph = if expanded { "    ▾ " } else { "    ▸ " };
+        return (glyph, app.theme.teal);
+    }
+    if entry.source == Source::Pane {
+        return ("      · ", app.theme.overlay0);
+    }
+    // Workspaces show expand/collapse glyph when expandable.
     let is_workspace = entry.source == Source::Workspace;
+    let is_tab = false; // tabs handled above
+    let _ = is_tab;
+    let expand_key = match &entry.action {
+        EntryAction::FocusWorkspace { id } => Some(format!("ws:{id}")),
+        _ => None,
+    };
+    if is_workspace {
+        if let Some(key) = &expand_key {
+            let expanded = app.expanded.contains(key);
+            let glyph = if expanded { "  ▾ " } else { "  ▸ " };
+            // Still show diamond for current/previous/pinned.
+            let is_current = entry.search_terms.iter().any(|term| term == "focused");
+            let is_previous = app.config.jump_back.pin_previous
+                && app.query.trim().is_empty()
+                && app.source_filter.is_none()
+                && entry.workspace_id.is_some()
+                && entry.workspace_id == app.previous_workspace_id;
+            if app.is_pinned(entry) {
+                return ("  ◆  ", app.theme.yellow);
+            } else if is_current {
+                return ("  ◆  ", app.theme.accent);
+            } else if is_previous {
+                return ("  ◆  ", app.theme.red);
+            }
+            return (glyph, app.theme.green);
+        }
+    }
     let is_current = is_workspace && entry.search_terms.iter().any(|term| term == "focused");
     let is_previous = is_workspace
         && app.config.jump_back.pin_previous
@@ -661,12 +714,30 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) -> ListHits {
     let mut item_entries = Vec::new();
     let mut selected_row = None;
     for (row, idx) in app.filtered.iter().enumerate() {
-        let e = &app.entries[*idx];
+        let e = app.get_entry(*idx).expect("filtered index must resolve");
         let color = source_color(&app.theme, &e.source);
-        let group_start =
-            row == 0 || app.entries[app.filtered[row - 1]].source_name() != e.source_name();
-        let group_end = row + 1 == app.filtered.len()
-            || app.entries[app.filtered[row + 1]].source_name() != e.source_name();
+        // In search mode, flat pane entries are top-level search results and
+        // should get their own group headers. In tree mode, children are
+        // indented under their parent and never get headers.
+        let is_child = *idx >= app.entries.len() && !app.search_fetched;
+        let group_start = if is_child {
+            false
+        } else {
+            row == 0
+                || app
+                    .get_entry(app.filtered[row - 1])
+                    .map(|e| e.source_name())
+                    != Some(e.source_name())
+        };
+        let group_end = if is_child {
+            false
+        } else {
+            row + 1 == app.filtered.len()
+                || app
+                    .get_entry(app.filtered[row + 1])
+                    .map(|e| e.source_name())
+                    != Some(e.source_name())
+        };
         if group_start {
             items.push(ListItem::new(Line::from(Span::styled(
                 format!(" ▾ {} ", e.source_name()),
@@ -932,6 +1003,8 @@ fn preview_text(app: &App, e: &Entry) -> String {
     let action: &str = match &e.action {
         EntryAction::FocusWorkspace { .. } => "focus existing workspace",
         EntryAction::FocusAgent { .. } => "focus agent pane",
+        EntryAction::FocusTab { .. } => "focus tab",
+        EntryAction::FocusPane { .. } => "focus pane",
         EntryAction::OpenRemote { .. } => "open remote Herdr",
         EntryAction::AttachSession { .. } => "attach Herdr session",
         EntryAction::InvokePluginAction { .. } => "invoke Herdr plugin action",
@@ -967,6 +1040,8 @@ fn source_color(theme: &Theme, source: &Source) -> Color {
         Source::Session => theme.green,
         Source::QuickAction => theme.mauve,
         Source::Integration => theme.red,
+        Source::Tab => theme.teal,
+        Source::Pane => theme.peach,
     }
 }
 
@@ -996,6 +1071,7 @@ mod tests {
             action: EntryAction::FocusOrCreateDir,
             source_label: None,
             search_terms: vec![],
+            parent_id: None,
             canonical: OnceLock::new(),
         }
     }
