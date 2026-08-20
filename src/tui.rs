@@ -652,11 +652,11 @@ fn entry_branch(app: &App, entry: &Entry, group_end: bool) -> (&'static str, Col
             _ => String::new(),
         };
         let expanded = app.expanded.contains(&key);
-        let glyph = if expanded { "  ▾ " } else { "  ▸ " };
+        let glyph = if expanded { "    ▾ " } else { "    ▸ " };
         return (glyph, app.theme.teal);
     }
     if entry.source == Source::Pane {
-        return ("    · ", app.theme.overlay0);
+        return ("      · ", app.theme.overlay0);
     }
     // Workspaces show expand/collapse glyph when expandable.
     let is_workspace = entry.source == Source::Workspace;

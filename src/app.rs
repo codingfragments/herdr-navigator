@@ -226,44 +226,58 @@ impl App {
     }
 
     /// Insert tree children (tabs/panes) into `filtered` after their expanded
-    /// parents. Children are stored in `child_entries`; their filtered index
-    /// is `entries.len() + child_index`.
+    /// parents, recursively so expanded tabs get their panes too. Children
+    /// are stored in `child_entries`; their filtered index is
+    /// `entries.len() + child_index`.
     fn interleave_children(&mut self) {
         if self.expanded.is_empty() || self.filtered.is_empty() {
             return;
         }
-        // Build a new filtered list that inserts children after expanded parents.
+        let entries_len = self.entries.len();
         let mut new_filtered = Vec::with_capacity(self.filtered.len());
         let mut new_scores = Vec::with_capacity(self.filtered.len());
-        let entries_len = self.entries.len();
-        for (i, &idx) in self.filtered.iter().enumerate() {
-            new_filtered.push(idx);
-            new_scores.push(self.filtered_scores.get(i).copied().unwrap_or(0));
-            // Check if this entry is an expanded workspace or tab.
-            let Some(entry) = self.get_entry(idx) else {
-                continue;
+        // Recursive walk: for each entry in the base list, push it, then if
+        // expanded, push its children (and recurse into each child).
+        fn walk(
+            idx: usize,
+            score: i64,
+            app: &App,
+            entries_len: usize,
+            out: &mut Vec<usize>,
+            scores: &mut Vec<i64>,
+        ) {
+            out.push(idx);
+            scores.push(score);
+            let Some(entry) = app.get_entry(idx) else {
+                return;
             };
-            let expand_key = match &entry.action {
-                EntryAction::FocusWorkspace { id } => Some(format!("ws:{id}")),
-                EntryAction::FocusTab { id } => Some(format!("tab:{id}")),
-                _ => None,
+            let (expand_key, parent_id) = match &entry.action {
+                EntryAction::FocusWorkspace { id } => (format!("ws:{id}"), Some(id.clone())),
+                EntryAction::FocusTab { id } => (format!("tab:{id}"), Some(id.clone())),
+                _ => return,
             };
-            if let Some(key) = expand_key {
-                if self.expanded.contains(&key) {
-                    // Insert children whose parent_id matches this entry.
-                    let parent_id = match &entry.action {
-                        EntryAction::FocusWorkspace { id } => id.clone(),
-                        EntryAction::FocusTab { id } => id.clone(),
-                        _ => continue,
-                    };
-                    for (ci, child) in self.child_entries.iter().enumerate() {
-                        if child.parent_id.as_deref() == Some(&parent_id) {
-                            new_filtered.push(entries_len + ci);
-                            new_scores.push(0);
-                        }
-                    }
+            if !app.expanded.contains(&expand_key) {
+                return;
+            }
+            let Some(parent_id) = parent_id else {
+                return;
+            };
+            for (ci, child) in app.child_entries.iter().enumerate() {
+                if child.parent_id.as_deref() == Some(&parent_id) {
+                    walk(entries_len + ci, 0, app, entries_len, out, scores);
                 }
             }
+        }
+        for (i, &idx) in self.filtered.iter().enumerate() {
+            let score = self.filtered_scores.get(i).copied().unwrap_or(0);
+            walk(
+                idx,
+                score,
+                self,
+                entries_len,
+                &mut new_filtered,
+                &mut new_scores,
+            );
         }
         self.filtered = new_filtered;
         self.filtered_scores = new_scores;
@@ -1561,6 +1575,64 @@ mod tests {
         app.collapse_selected();
         assert_eq!(app.selected_entry().unwrap().title, "bravo");
         assert!(!app.selected_is_expanded());
+    }
+
+    #[test]
+    fn interleave_children_recurses_into_expanded_tabs() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        ws.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        app.entries = vec![ws];
+        app.apply_filter();
+
+        // Add a tab child and a pane child (simulating fetch).
+        app.child_entries.push(Entry {
+            source: Source::Tab,
+            title: "main".into(),
+            subtitle: String::new(),
+            path: PathBuf::new(),
+            workspace_id: Some("w1".into()),
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusTab { id: "w1:t1".into() },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1".into()),
+            canonical: OnceLock::new(),
+        });
+        app.child_entries.push(Entry {
+            source: Source::Pane,
+            title: "shell".into(),
+            subtitle: String::new(),
+            path: PathBuf::new(),
+            workspace_id: Some("w1".into()),
+            workspace_label: None,
+            agent_target: None,
+            project: None,
+            action: EntryAction::FocusPane {
+                id: "w1:t1:p1".into(),
+            },
+            source_label: None,
+            search_terms: vec![],
+            parent_id: Some("w1:t1".into()),
+            canonical: OnceLock::new(),
+        });
+
+        // Expand both the workspace and its tab.
+        app.expanded.insert("ws:w1".to_string());
+        app.expanded.insert("tab:w1:t1".to_string());
+        app.apply_filter();
+
+        // Should see: workspace, tab, pane (3 entries).
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(
+            app.get_entry(app.filtered[0]).unwrap().source,
+            Source::Workspace
+        );
+        assert_eq!(app.get_entry(app.filtered[1]).unwrap().source, Source::Tab);
+        assert_eq!(app.get_entry(app.filtered[2]).unwrap().source, Source::Pane);
     }
 
     #[test]
