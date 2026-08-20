@@ -48,6 +48,7 @@ preview_scrollback_lines = 200  # lines of scrollback to read for panes
 preview_tree_depth = 2        # max depth of the directory tree
 preview_tree_max_per_level = 2 # entries shown per tree level (rest summarized)
 preview_git_status = true      # show git info block for repo directories
+preview_refresh_interval_secs = 2  # auto-refresh pane scrollback (0 disables)
 
 # Use Herdr-style source-aware rows: metadata aligns right, while zoxide/root
 # entries expand to a second full-path line. Set false for the compact list.

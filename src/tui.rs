@@ -53,10 +53,19 @@ pub(crate) fn tui_loop(
         }
         terminal.draw(|f| list_hits = draw(f, app))?;
         let animate = has_working_entry(app);
-        if (animate || update_check.is_some()) && !event::poll(Duration::from_millis(125))? {
+        // Also poll periodically when a pane scrollback preview is active, so
+        // the auto-refresh timer can fire even without working agents.
+        let pane_preview =
+            app.selected_entry_is_pane() && app.config.picker.preview_refresh_interval_secs > 0;
+        if (animate || pane_preview || update_check.is_some())
+            && !event::poll(Duration::from_millis(125))?
+        {
             if animate {
                 app.spinner_tick = app.spinner_tick.wrapping_add(1);
             }
+            // Invalidate the pane scrollback cache when the refresh interval
+            // elapses, so the next draw re-fetches the scrollback.
+            app.maybe_refresh_pane_preview();
             continue;
         }
         let action = match event::read()? {

@@ -52,6 +52,9 @@ pub(crate) struct App {
     pub(crate) list_height: u16,
     pub(crate) preview_cache_key: Option<String>,
     pub(crate) preview_cache: Option<ratatui::text::Text<'static>>,
+    /// When the pane scrollback preview was last refreshed. Used by the TUI
+    /// loop to re-fetch scrollback on a configurable interval.
+    pub(crate) last_preview_refresh: Option<std::time::Instant>,
 }
 
 impl App {
@@ -77,6 +80,7 @@ impl App {
             list_height: 0,
             preview_cache_key: None,
             preview_cache: None,
+            last_preview_refresh: None,
         }
     }
 
@@ -303,7 +307,37 @@ impl App {
         };
         self.preview_cache_key = key;
         self.preview_cache = Some(text.clone());
+        self.last_preview_refresh = Some(std::time::Instant::now());
         text
+    }
+
+    /// Whether the selected entry is a pane whose scrollback should auto-refresh.
+    pub(crate) fn selected_entry_is_pane(&self) -> bool {
+        matches!(
+            self.selected_entry().map(|e| e.source.clone()),
+            Some(crate::model::Source::Agent) | Some(crate::model::Source::Workspace)
+        )
+    }
+
+    /// If the pane scrollback refresh interval has elapsed, invalidate the
+    /// preview cache so the next render re-fetches the scrollback. Returns
+    /// true if the cache was invalidated.
+    pub(crate) fn maybe_refresh_pane_preview(&mut self) -> bool {
+        let interval = self.config.picker.preview_refresh_interval_secs;
+        if interval == 0 || !self.selected_entry_is_pane() {
+            return false;
+        }
+        let elapsed = self
+            .last_preview_refresh
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        if elapsed >= std::time::Duration::from_secs(interval) {
+            self.preview_cache_key = None;
+            self.preview_cache = None;
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn is_pinned(&self, entry: &Entry) -> bool {
@@ -1152,6 +1186,51 @@ mod tests {
         assert_eq!(app.selected, 0);
         app.page_up();
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn maybe_refresh_pane_preview_invalidates_after_interval() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        // Non-pane source (zoxide) -> no refresh.
+        app.entries = vec![entry(Source::Zoxide, "/tmp", "x")];
+        app.apply_filter();
+        app.last_preview_refresh = Some(std::time::Instant::now());
+        assert!(!app.maybe_refresh_pane_preview());
+
+        // Pane source (workspace) but interval not elapsed -> no refresh.
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        app.entries = vec![ws];
+        app.apply_filter();
+        app.last_preview_refresh = Some(std::time::Instant::now());
+        app.preview_cache_key = Some("key".into());
+        assert!(!app.maybe_refresh_pane_preview());
+        assert!(app.preview_cache_key.is_some());
+
+        // Pane source and interval elapsed -> cache invalidated.
+        app.last_preview_refresh =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        assert!(app.maybe_refresh_pane_preview());
+        assert!(app.preview_cache_key.is_none());
+    }
+
+    #[test]
+    fn maybe_refresh_pane_preview_disabled_when_interval_zero() {
+        let config = toml::from_str::<Config>(
+            r#"
+[picker]
+preview_refresh_interval_secs = 0
+"#,
+        )
+        .unwrap();
+        let mut app = App::new(config, Theme::load(None, None, false));
+        let mut ws = entry(Source::Workspace, "/tmp", "x");
+        ws.workspace_id = Some("w1".into());
+        app.entries = vec![ws];
+        app.apply_filter();
+        app.last_preview_refresh =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        assert!(!app.maybe_refresh_pane_preview());
     }
 
     #[test]
