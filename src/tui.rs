@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 
@@ -53,10 +53,19 @@ pub(crate) fn tui_loop(
         }
         terminal.draw(|f| list_hits = draw(f, app))?;
         let animate = has_working_entry(app);
-        if (animate || update_check.is_some()) && !event::poll(Duration::from_millis(125))? {
+        // Also poll periodically when a pane scrollback preview is active, so
+        // the auto-refresh timer can fire even without working agents.
+        let pane_preview =
+            app.selected_entry_is_pane() && app.config.picker.preview_refresh_interval_secs > 0;
+        if (animate || pane_preview || update_check.is_some())
+            && !event::poll(Duration::from_millis(125))?
+        {
             if animate {
                 app.spinner_tick = app.spinner_tick.wrapping_add(1);
             }
+            // Invalidate the pane scrollback cache when the refresh interval
+            // elapses, so the next draw re-fetches the scrollback.
+            app.maybe_refresh_pane_preview();
             continue;
         }
         let action = match event::read()? {
@@ -861,21 +870,39 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) -> ListHits {
     }
 }
 
-fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
+    // Pane scrollback (Agent only for now) is bottom-anchored: the last line
+    // of the scrollback is the last line displayed, so you see the most recent
+    // output. Workspaces use the legacy metadata preview until proper pane
+    // preview is wired up for them. Other previews are top-anchored.
+    let is_pane = matches!(
+        app.selected_entry().map(|e| e.source.clone()),
+        Some(Source::Agent)
+    );
     let text = if let Some(e) = app.selected_entry() {
-        preview_text(app, e)
+        match e.source {
+            Source::Agent | Source::Zoxide | Source::Root => app.rich_preview(),
+            _ => ratatui::text::Text::raw(preview_text(app, e)),
+        }
     } else {
-        "No results".into()
+        ratatui::text::Text::raw("No results")
     };
+    let block = Block::default()
+        .title(" Preview ")
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(app.theme.surface_dim));
+    let inner = block.inner(area);
+    // Bottom-anchor: scroll down so the last line is at the bottom of the area.
+    let scroll_y = if is_pane {
+        text.lines.len().saturating_sub(inner.height as usize) as u16
+    } else {
+        0
+    };
+    // No wrap: long lines are cut horizontally at the preview boundary.
     let p = Paragraph::new(text)
         .style(Style::default().fg(app.theme.text))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Preview ")
-                .borders(Borders::LEFT)
-                .border_style(Style::default().fg(app.theme.surface_dim)),
-        );
+        .scroll((scroll_y, 0))
+        .block(block);
     f.render_widget(p, area);
 }
 

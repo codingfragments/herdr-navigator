@@ -49,6 +49,18 @@ pub(crate) struct PickerConfig {
     pub(crate) agent_sort: String,
     #[serde(default = "yes")]
     pub(crate) preview: bool,
+    #[serde(default = "default_preview_scrollback_lines")]
+    pub(crate) preview_scrollback_lines: u32,
+    #[serde(default = "default_preview_tree_depth")]
+    pub(crate) preview_tree_depth: u32,
+    #[serde(default = "default_preview_tree_max_per_level")]
+    pub(crate) preview_tree_max_per_level: u32,
+    #[serde(default = "yes")]
+    pub(crate) preview_git_status: bool,
+    /// Auto-refresh interval for pane scrollback previews, in seconds. 0
+    /// disables auto-refresh. Default 2.
+    #[serde(default = "default_preview_refresh_interval_secs")]
+    pub(crate) preview_refresh_interval_secs: u64,
     #[serde(default = "yes")]
     pub(crate) detailed_rows: bool,
     #[serde(default = "yes")]
@@ -223,6 +235,18 @@ fn default_agent_sort() -> String {
 fn default_directory_template_key() -> String {
     "alt-enter".into()
 }
+fn default_preview_scrollback_lines() -> u32 {
+    200
+}
+fn default_preview_tree_depth() -> u32 {
+    2
+}
+fn default_preview_tree_max_per_level() -> u32 {
+    2
+}
+fn default_preview_refresh_interval_secs() -> u64 {
+    2
+}
 fn default_notification_sound() -> String {
     "default".into()
 }
@@ -270,6 +294,11 @@ impl Default for PickerConfig {
             source_priority_boost: default_source_priority_boost(),
             agent_sort: default_agent_sort(),
             preview: true,
+            preview_scrollback_lines: default_preview_scrollback_lines(),
+            preview_tree_depth: default_preview_tree_depth(),
+            preview_tree_max_per_level: default_preview_tree_max_per_level(),
+            preview_git_status: true,
+            preview_refresh_interval_secs: default_preview_refresh_interval_secs(),
             detailed_rows: true,
             check_updates: true,
             directory_template: None,

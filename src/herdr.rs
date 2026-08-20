@@ -21,6 +21,19 @@ pub(crate) fn herdr_json<const N: usize>(args: [&str; N]) -> Result<Value, Strin
     }
     serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
 }
+
+/// Runs a Herdr CLI command and returns stdout as raw text (for commands like
+/// `pane read` that print content rather than JSON).
+pub(crate) fn herdr_text<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let out = Command::new(herdr_bin())
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    String::from_utf8(out.stdout).map_err(|e| e.to_string())
+}
 pub(crate) fn run_herdr<const N: usize>(args: [&str; N]) -> Result<(), String> {
     let status = Command::new(herdr_bin())
         .args(args)

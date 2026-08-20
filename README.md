@@ -244,6 +244,11 @@ source_order = ["workspace", "agent", "project", "session", "zoxide", "root", "s
 source_priority_boost = 5
 agent_sort = "herdr" # herdr | priority | spaces
 preview = true
+preview_scrollback_lines = 200 # pane scrollback lines shown for agents/workspaces
+preview_tree_depth = 2 # max depth of the directory tree for zoxide/root
+preview_tree_max_per_level = 2 # entries per tree level (rest summarized as …)
+preview_git_status = true # show git info block for repo directories
+preview_refresh_interval_secs = 2 # auto-refresh pane scrollback (0 = off)
 detailed_rows = true # source-aware Herdr-style result rows
 check_updates = true # daily background release check
 # directory_template = "default.toml" # Herdr Plus project file
@@ -283,6 +288,7 @@ max_depth = 3
 Useful config surfaces:
 
 - `picker.detailed_rows` enables source-aware rows: right-aligned metadata for most sources and a full-path second line only for zoxide/root.
+- `picker.preview` toggles the right-side preview pane (`Ctrl-O` at runtime). The preview is source-aware: agents and workspaces show the pane's recent scrollback buffer (ANSI colors preserved, bottom-anchored, auto-refreshing every `preview_refresh_interval_secs` seconds), and zoxide/root entries show a fixed git information block (branch, ahead/behind, untracked/staged/unstaged/stash counts, ref decoration, top 3 remotes) followed by a compact colored directory tree. `preview_scrollback_lines` (default 200), `preview_tree_depth` (default 2), `preview_tree_max_per_level` (default 2), `preview_git_status` (default true), and `preview_refresh_interval_secs` (default 2, 0 disables) tune the rich preview; the work is cached per selection so it runs once when you land on an entry, not every frame.
 - `picker.check_updates` checks GitHub releases in the background at most daily and shows `↑ vX.Y.Z available · F5 update`; press `F5`, confirm, and Navigator installs that release through Herdr. Failures stay silent until an update is requested.
 - `picker.prefix_workspace_labels` defaults to `true` and prefixes newly created workspace labels with `project:` or `dir:`. Set it to `false` for plain labels; Navigator still persists the workspace kind.
 - `picker.directory_template = "default.toml"` reuses that Herdr Plus project file from its `projects/` config directory. `Enter` keeps normal reuse/create behavior. `picker.directory_template_key` defaults to `alt-enter` and also accepts Ctrl forms such as `ctrl-g`; the shortcut always applies all template tabs, panes, labels, and commands using the selected directory instead of the template's `working_dir`, creating the workspace or appending fresh template tabs.

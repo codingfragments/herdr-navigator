@@ -5,6 +5,7 @@ All notable changes to this project are documented here.
 ## [Unreleased]
 
 ### Added
+- Source-aware rich preview pane. Selecting an agent or workspace shows the pane's recent scrollback buffer (ANSI colors preserved, bottom-anchored, auto-refreshing); selecting a zoxide/root directory shows a fixed git information block (branch, ahead/behind, untracked/staged/unstaged/stash counts, ref decoration, top 3 remotes) followed by a compact, colored directory tree. Other sources keep the metadata preview. Subprocess work is cached per selection. New `[picker]` knobs: `preview_scrollback_lines` (default 200), `preview_tree_depth` (default 2), `preview_tree_max_per_level` (default 2), `preview_git_status` (default true), `preview_refresh_interval_secs` (default 2, 0 disables).
 - `PageUp` / `PageDown` move the selection by one visible page in addition to `Up` / `Down`.
 - `herdr-navigator.open-popup` action and `picker-popup` pane open the picker as a centered 80% × 80% popup over the focused workspace instead of a full-screen overlay. Transient like the overlay (closes on `Enter`/`Esc`) and launch-or-focus within the focused workspace.
 - Navigator-specific `[theme].name` and `[theme.custom]` overrides. Navigator layers inherited Herdr custom tokens beneath its own custom tokens ([#20](https://github.com/thanhdat77/herdr-navigator/issues/20)).
