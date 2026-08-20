@@ -198,7 +198,11 @@ fn git_info(path: &Path) -> Option<GitInfo> {
         } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
             info.upstream = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
-            info.sha = Some(rest.get(..7).unwrap_or(rest).to_string());
+            // On an unborn branch this is the literal "(initial)" rather
+            // than a SHA; only accept hex object ids so we don't show garbage.
+            if rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                info.sha = Some(rest.get(..7).unwrap_or(rest).to_string());
+            }
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
             for tok in rest.split_whitespace() {
                 if let Some(a) = tok.strip_prefix('+') {
@@ -351,6 +355,12 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
             theme.subtext0
         };
         pos.push(Span::styled(p.to_string(), Style::default().fg(color)));
+    } else if info.branch.is_some() && info.sha.is_none() {
+        // Unborn branch (no commits yet): HEAD does not resolve to an object.
+        pos.push(Span::styled(
+            "(no commits)",
+            Style::default().fg(theme.subtext0),
+        ));
     }
     if let Some(up) = &info.upstream {
         pos.push(Span::styled(" → ", dim));
@@ -801,6 +811,33 @@ mod tests {
             .join("\n");
         // SHA is shown as the position when describe equals the SHA.
         assert!(joined.contains("abc1234"));
+    }
+
+    #[test]
+    fn render_git_info_shows_no_commits_for_unborn_branch() {
+        // Unborn branch: no SHA, no describe, but a branch name exists.
+        let info = GitInfo {
+            branch: Some("main".into()),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: None,
+            describe: None,
+            remotes: vec![],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("(no commits)"));
+        // Should not show a garbage SHA like "(initia".
+        assert!(!joined.contains("(initia"));
     }
 
     #[test]
