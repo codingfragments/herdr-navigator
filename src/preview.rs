@@ -29,6 +29,8 @@ use crate::herdr::{herdr_json, herdr_text};
 use crate::model::{Entry, Source};
 use crate::theme::Theme;
 
+type TreeEntry = (String, PathBuf, bool);
+
 /// Build the rich preview for an entry. Returns owned `Text` so it can be
 /// cached on `App` and cloned into the render cheaply.
 pub(crate) fn build_preview(entry: &Entry, config: &Config, theme: &Theme) -> Text<'static> {
@@ -338,10 +340,12 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// Build a depth-limited, colored directory tree. Directories are listed before
-/// files; at most `max_per_level` entries are shown per directory, with a
-/// `… (N more)` summary line for the rest. Symlinks and unreadable entries are
-/// skipped quietly.
+/// Build a depth-limited, colored directory tree. Directories are listed
+/// before files. The first layer shows up to `ROOT_MAX_DIRS` (5) directories
+/// and `ROOT_MAX_FILES` (10) files; deeper layers show at most
+/// `max_per_level` entries of each kind. Truncated categories get a
+/// `… (N more)` summary line. Symlinks and unreadable entries are skipped
+/// quietly.
 fn directory_tree(
     root: &Path,
     max_depth: u32,
@@ -352,6 +356,9 @@ fn directory_tree(
     walk(root, "", 0, max_depth, max_per_level, theme, &mut lines);
     lines
 }
+
+const ROOT_MAX_DIRS: usize = 5;
+const ROOT_MAX_FILES: usize = 10;
 
 fn walk(
     dir: &Path,
@@ -366,7 +373,7 @@ fn walk(
         Ok(r) => r,
         Err(_) => return,
     };
-    let mut entries: Vec<(String, PathBuf, bool)> = read
+    let mut entries: Vec<TreeEntry> = read
         .filter_map(Result::ok)
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
@@ -377,12 +384,29 @@ fn walk(
     // Directories first, then files; both alphabetical.
     entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
-    let total = entries.len();
-    let shown: Vec<&(String, PathBuf, bool)> = entries.iter().take(max_per_level).collect();
-    let has_more = total > max_per_level;
+    let (mut dirs, mut files): (Vec<TreeEntry>, Vec<TreeEntry>) =
+        entries.into_iter().partition(|(_, _, is_dir)| *is_dir);
 
-    for (i, (name, path, is_dir)) in shown.iter().enumerate() {
-        let last = i + 1 == shown.len() && !has_more;
+    // First layer is more generous than deeper ones.
+    let (dir_cap, file_cap) = if depth == 0 {
+        (ROOT_MAX_DIRS, ROOT_MAX_FILES)
+    } else {
+        (max_per_level, max_per_level)
+    };
+
+    let dir_more = dirs.len().saturating_sub(dir_cap);
+    let file_more = files.len().saturating_sub(file_cap);
+    dirs.truncate(dir_cap);
+    files.truncate(file_cap);
+
+    // Combine into the rendered list, dirs first. A category's last item uses
+    // the └── marker only if nothing (files or a … summary) follows it.
+    let total_items =
+        dirs.len() + files.len() + usize::from(dir_more > 0) + usize::from(file_more > 0);
+    let mut index = 0usize;
+    for (name, path, is_dir) in dirs.iter().chain(files.iter()) {
+        index += 1;
+        let last = index == total_items;
         let marker = if last { "└── " } else { "├── " };
         let marker_span = Span::styled(
             format!("{prefix}{marker}"),
@@ -410,12 +434,26 @@ fn walk(
             );
         }
     }
-    if has_more {
-        let more = total - max_per_level;
+    // … summary lines for truncated categories, in the same dirs-then-files order.
+    if dir_more > 0 {
+        let last = file_more == 0;
+        let marker = if last { "└── " } else { "├── " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{prefix}{marker}"),
+                Style::default().fg(theme.overlay0),
+            ),
+            Span::styled(
+                format!("… ({} more dirs)", dir_more),
+                Style::default().fg(theme.subtext0),
+            ),
+        ]));
+    }
+    if file_more > 0 {
         lines.push(Line::from(vec![
             Span::styled(format!("{prefix}└── "), Style::default().fg(theme.overlay0)),
             Span::styled(
-                format!("… ({} more)", more),
+                format!("… ({} more files)", file_more),
                 Style::default().fg(theme.subtext0),
             ),
         ]));
@@ -485,11 +523,38 @@ mod tests {
     }
 
     #[test]
-    fn directory_tree_respects_max_per_level() {
-        let dir = std::env::temp_dir().join(format!("nav-tree-cap-{}", std::process::id()));
+    fn directory_tree_root_caps_dirs_and_files_separately() {
+        let dir = std::env::temp_dir().join(format!("nav-tree-root-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..5 {
+        // 7 dirs + 12 files at the root layer.
+        for i in 0..7 {
+            std::fs::create_dir_all(dir.join(format!("d{i}"))).unwrap();
+        }
+        for i in 0..12 {
             std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        // depth 1 so only the root layer is rendered; max_per_level governs
+        // deeper layers only.
+        let tree = directory_tree(&dir, 1, 2, &theme());
+        let joined: String = tree
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Root shows up to 5 dirs and 10 files, summarizing the rest.
+        assert!(joined.contains("… (2 more dirs)"));
+        assert!(joined.contains("… (2 more files)"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_tree_deeper_layers_use_max_per_level() {
+        let dir = std::env::temp_dir().join(format!("nav-tree-deep-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        // 5 files inside the single subdirectory (a deeper layer).
+        for i in 0..5 {
+            std::fs::write(dir.join("sub").join(format!("f{i}.txt")), "x").unwrap();
         }
         let tree = directory_tree(&dir, 2, 2, &theme());
         let joined: String = tree
@@ -497,7 +562,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("… (3 more)"));
+        // Deeper layer caps at max_per_level=2 files.
+        assert!(joined.contains("… (3 more files)"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
