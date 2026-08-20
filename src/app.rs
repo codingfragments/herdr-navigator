@@ -366,6 +366,28 @@ impl App {
         }
     }
 
+    /// Re-apply the filter while preserving the current selection. Used by
+    /// expand/collapse so the cursor doesn't jump to the top of the list.
+    fn reapply_filter_preserving_selection(&mut self) {
+        let selected_key = self
+            .filtered
+            .get(self.selected)
+            .and_then(|&idx| self.get_entry(idx))
+            .map(entry_identity_key);
+        self.apply_filter();
+        if let Some(key) = selected_key {
+            self.selected = self
+                .filtered
+                .iter()
+                .position(|&idx| {
+                    self.get_entry(idx)
+                        .map(|e| entry_identity_key(e) == key)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0);
+        }
+    }
+
     /// Expand the selected workspace or tab entry, fetching children if needed.
     pub(crate) fn expand_selected(&mut self) {
         let Some(entry) = self.selected_entry().cloned() else {
@@ -400,7 +422,7 @@ impl App {
                     self.fetch_tabs(ws_id);
                 }
             }
-            self.apply_filter();
+            self.reapply_filter_preserving_selection();
         }
     }
 
@@ -415,7 +437,7 @@ impl App {
             _ => return,
         };
         if self.expanded.remove(&key) {
-            self.apply_filter();
+            self.reapply_filter_preserving_selection();
         }
     }
 
@@ -1136,6 +1158,31 @@ fn herdr_agent_panel_sort() -> String {
         .unwrap_or_else(|| "spaces".into())
 }
 
+/// A stable identity for an entry, used to preserve selection across
+/// filter rebuilds (expansion/collapse). Distinct from `pin_key` which is
+/// for user pins; this includes the source so a workspace and a tab child
+/// with the same id don't collide.
+fn entry_identity_key(entry: &Entry) -> String {
+    match &entry.action {
+        EntryAction::FocusWorkspace { id } => format!("workspace:{id}"),
+        EntryAction::FocusAgent { target } => format!("agent:{target}"),
+        EntryAction::FocusTab { id } => format!("tab:{id}"),
+        EntryAction::FocusPane { id } => format!("pane:{id}"),
+        EntryAction::OpenProject => format!("project:{}", entry.key()),
+        EntryAction::OpenRemote { target } => format!("remote:{target}"),
+        EntryAction::AttachSession { name, remote } => {
+            format!("session:{}:{name}", remote.as_deref().unwrap_or("local"))
+        }
+        EntryAction::InvokePluginAction { action } => {
+            format!("plugin:{}:{action}", entry.source_name())
+        }
+        EntryAction::FocusOrCreateDir => format!("{}:{}", entry.source_name(), entry.key()),
+        EntryAction::RunCommand { command, .. } => {
+            format!("{}:{command}", entry.source_name())
+        }
+    }
+}
+
 fn pin_key(entry: &Entry) -> String {
     match &entry.action {
         EntryAction::FocusWorkspace { id } => format!("workspace:{id}"),
@@ -1487,6 +1534,33 @@ mod tests {
         app.query = "x".into();
         app.apply_filter();
         assert_eq!(app.filtered.len(), 1); // just the workspace
+    }
+
+    #[test]
+    fn expand_preserves_current_selection() {
+        let mut app = App::new(Config::default(), Theme::load(None, None, false));
+        let mut ws1 = entry(Source::Workspace, "/a", "alpha");
+        ws1.workspace_id = Some("w1".into());
+        ws1.action = EntryAction::FocusWorkspace { id: "w1".into() };
+        let mut ws2 = entry(Source::Workspace, "/b", "bravo");
+        ws2.workspace_id = Some("w2".into());
+        ws2.action = EntryAction::FocusWorkspace { id: "w2".into() };
+        app.entries = vec![ws1, ws2];
+        app.apply_filter();
+
+        // Select the second workspace.
+        app.selected = 1;
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+
+        // Expand it — selection must stay on bravo, not reset to alpha.
+        app.expand_selected();
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+        assert!(app.selected_is_expanded());
+
+        // Collapse — selection still stays on bravo.
+        app.collapse_selected();
+        assert_eq!(app.selected_entry().unwrap().title, "bravo");
+        assert!(!app.selected_is_expanded());
     }
 
     #[test]
