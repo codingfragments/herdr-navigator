@@ -304,12 +304,14 @@ impl App {
             } else {
                 label.to_string()
             };
-            let subtitle = format!(
-                "{}{} · {} panes",
-                if focused { "focused · " } else { "" },
-                status,
-                pane_count
-            );
+            let prefix: String = if focused {
+                "focused · ".into()
+            } else if status != "unknown" {
+                format!("{status} · ")
+            } else {
+                String::new()
+            };
+            let subtitle = format!("{prefix}{pane_count} panes");
             self.child_entries.push(Entry {
                 source: Source::Tab,
                 title,
