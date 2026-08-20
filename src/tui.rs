@@ -871,16 +871,17 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) -> ListHits {
 }
 
 fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
-    // Pane scrollback (Agent/Workspace) is bottom-anchored: the last line of
-    // the scrollback is the last line displayed, so you see the most recent
-    // output. Other previews are top-anchored.
+    // Pane scrollback (Agent only for now) is bottom-anchored: the last line
+    // of the scrollback is the last line displayed, so you see the most recent
+    // output. Workspaces use the legacy metadata preview until proper pane
+    // preview is wired up for them. Other previews are top-anchored.
     let is_pane = matches!(
         app.selected_entry().map(|e| e.source.clone()),
-        Some(Source::Agent) | Some(Source::Workspace)
+        Some(Source::Agent)
     );
     let text = if let Some(e) = app.selected_entry() {
         match e.source {
-            Source::Agent | Source::Workspace | Source::Zoxide | Source::Root => app.rich_preview(),
+            Source::Agent | Source::Zoxide | Source::Root => app.rich_preview(),
             _ => ratatui::text::Text::raw(preview_text(app, e)),
         }
     } else {

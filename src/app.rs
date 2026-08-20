@@ -315,7 +315,7 @@ impl App {
     pub(crate) fn selected_entry_is_pane(&self) -> bool {
         matches!(
             self.selected_entry().map(|e| e.source.clone()),
-            Some(crate::model::Source::Agent) | Some(crate::model::Source::Workspace)
+            Some(crate::model::Source::Agent)
         )
     }
 
@@ -1197,10 +1197,10 @@ mod tests {
         app.last_preview_refresh = Some(std::time::Instant::now());
         assert!(!app.maybe_refresh_pane_preview());
 
-        // Pane source (workspace) but interval not elapsed -> no refresh.
-        let mut ws = entry(Source::Workspace, "/tmp", "x");
-        ws.workspace_id = Some("w1".into());
-        app.entries = vec![ws];
+        // Pane source (agent) but interval not elapsed -> no refresh.
+        let mut agent = entry(Source::Agent, "/tmp", "x");
+        agent.agent_target = Some("w1:p1".into());
+        app.entries = vec![agent];
         app.apply_filter();
         app.last_preview_refresh = Some(std::time::Instant::now());
         app.preview_cache_key = Some("key".into());
@@ -1224,9 +1224,9 @@ preview_refresh_interval_secs = 0
         )
         .unwrap();
         let mut app = App::new(config, Theme::load(None, None, false));
-        let mut ws = entry(Source::Workspace, "/tmp", "x");
-        ws.workspace_id = Some("w1".into());
-        app.entries = vec![ws];
+        let mut agent = entry(Source::Agent, "/tmp", "x");
+        agent.agent_target = Some("w1:p1".into());
+        app.entries = vec![agent];
         app.apply_filter();
         app.last_preview_refresh =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(60));

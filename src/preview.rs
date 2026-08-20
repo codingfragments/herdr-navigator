@@ -36,7 +36,7 @@ type TreeEntry = (String, PathBuf, bool);
 pub(crate) fn build_preview(entry: &Entry, config: &Config, theme: &Theme) -> Text<'static> {
     let mut lines = header_lines(entry, theme);
     match entry.source {
-        Source::Agent | Source::Workspace => {
+        Source::Agent => {
             if let Some(text) = pane_scrollback(entry, config) {
                 lines.push(Line::from(""));
                 lines.extend(text.lines);
