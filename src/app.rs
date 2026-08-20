@@ -298,7 +298,7 @@ impl App {
         }
         let entry = self.selected_entry().cloned();
         let text = match entry {
-            Some(e) => crate::preview::build_preview(&e, &self.config),
+            Some(e) => crate::preview::build_preview(&e, &self.config, &self.theme),
             None => ratatui::text::Text::raw("No results"),
         };
         self.preview_cache_key = key;

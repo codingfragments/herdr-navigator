@@ -53,6 +53,8 @@ pub(crate) struct PickerConfig {
     pub(crate) preview_scrollback_lines: u32,
     #[serde(default = "default_preview_tree_depth")]
     pub(crate) preview_tree_depth: u32,
+    #[serde(default = "default_preview_tree_max_per_level")]
+    pub(crate) preview_tree_max_per_level: u32,
     #[serde(default = "yes")]
     pub(crate) preview_git_status: bool,
     #[serde(default = "yes")]
@@ -235,6 +237,9 @@ fn default_preview_scrollback_lines() -> u32 {
 fn default_preview_tree_depth() -> u32 {
     2
 }
+fn default_preview_tree_max_per_level() -> u32 {
+    2
+}
 fn default_notification_sound() -> String {
     "default".into()
 }
@@ -284,6 +289,7 @@ impl Default for PickerConfig {
             preview: true,
             preview_scrollback_lines: default_preview_scrollback_lines(),
             preview_tree_depth: default_preview_tree_depth(),
+            preview_tree_max_per_level: default_preview_tree_max_per_level(),
             preview_git_status: true,
             detailed_rows: true,
             check_updates: true,

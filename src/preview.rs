@@ -5,30 +5,34 @@
 //!
 //! - `Agent` / `Workspace` → the pane's recent scrollback buffer (with ANSI
 //!   colors preserved via `ansi-to-tui`).
-//! - `Zoxide` / `Root` → a depth-limited directory tree, prefixed with a
-//!   `git status` block when the path is inside a git repository.
+//! - `Zoxide` / `Root` → a fixed git information block (branch, ahead/behind,
+//!   untracked/staged/unstaged/stash counts, short SHA, top 3 remotes) followed
+//!   by a compact, colored directory tree.
 //!
 //! Other sources fall back to the legacy metadata preview in `tui::preview_text`.
 //!
-//! All subprocess work (Herdr pane read, `git status`) happens here and is
-//! cached by `App` keyed on the selected entry, so it runs once per selection
-//! change rather than every render. Missing tools or non-repo paths degrade
-//! quietly to a smaller preview.
+//! All subprocess work (Herdr pane read, `git status`, `git remote`) happens
+//! here and is cached by `App` keyed on the selected entry, so it runs once per
+//! selection change rather than every render. Missing tools or non-repo paths
+//! degrade quietly to a smaller preview.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ansi_to_tui::IntoText as _;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
 use crate::config::Config;
 use crate::herdr::{herdr_json, herdr_text};
 use crate::model::{Entry, Source};
+use crate::theme::Theme;
 
 /// Build the rich preview for an entry. Returns owned `Text` so it can be
 /// cached on `App` and cloned into the render cheaply.
-pub(crate) fn build_preview(entry: &Entry, config: &Config) -> Text<'static> {
-    let mut lines = header_lines(entry);
+pub(crate) fn build_preview(entry: &Entry, config: &Config, theme: &Theme) -> Text<'static> {
+    let mut lines = header_lines(entry, theme);
     match entry.source {
         Source::Agent | Source::Workspace => {
             if let Some(text) = pane_scrollback(entry, config) {
@@ -36,28 +40,31 @@ pub(crate) fn build_preview(entry: &Entry, config: &Config) -> Text<'static> {
                 lines.extend(text.lines);
             } else {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::raw(
+                lines.push(Line::from(Span::styled(
                     "no scrollback available for this pane",
+                    Style::default().fg(theme.subtext0),
                 )));
             }
         }
         Source::Zoxide | Source::Root => {
             if config.picker.preview_git_status {
-                if let Some(block) = git_status_block(&entry.path) {
+                if let Some(info) = git_info(&entry.path) {
                     lines.push(Line::from(""));
-                    lines.push(Line::from(Span::raw("git status")));
-                    lines.push(Line::from(Span::raw("──────────")));
-                    lines.extend(block.lines);
+                    lines.extend(render_git_info(&info, theme));
                 }
             }
             lines.push(Line::from(""));
             let tree = directory_tree(
                 &entry.path,
                 config.picker.preview_tree_depth,
-                config.picker.preview_tree_depth as usize * 40,
+                config.picker.preview_tree_max_per_level as usize,
+                theme,
             );
             if tree.is_empty() {
-                lines.push(Line::from(Span::raw("(empty or unreadable directory)")));
+                lines.push(Line::from(Span::styled(
+                    "(empty or unreadable directory)",
+                    Style::default().fg(theme.subtext0),
+                )));
             } else {
                 lines.extend(tree);
             }
@@ -68,16 +75,21 @@ pub(crate) fn build_preview(entry: &Entry, config: &Config) -> Text<'static> {
     Text::from(lines)
 }
 
-fn header_lines(entry: &Entry) -> Vec<Line<'static>> {
+fn header_lines(entry: &Entry, theme: &Theme) -> Vec<Line<'static>> {
+    let label = theme.subtext0;
+    let value = theme.text;
     vec![
         Line::from(vec![
-            Span::raw("type: "),
-            Span::raw(entry.source_name().to_string()),
+            Span::styled("type: ", Style::default().fg(label)),
+            Span::styled(entry.source_name().to_string(), Style::default().fg(value)),
         ]),
-        Line::from(vec![Span::raw("title: "), Span::raw(entry.title.clone())]),
         Line::from(vec![
-            Span::raw("path: "),
-            Span::raw(entry.path.display().to_string()),
+            Span::styled("title: ", Style::default().fg(label)),
+            Span::styled(entry.title.clone(), Style::default().fg(value)),
+        ]),
+        Line::from(vec![
+            Span::styled("path: ", Style::default().fg(label)),
+            Span::styled(entry.path.display().to_string(), Style::default().fg(value)),
         ]),
     ]
 }
@@ -122,40 +134,222 @@ fn pane_scrollback(entry: &Entry, config: &Config) -> Option<Text<'static>> {
     trimmed.into_text().ok()
 }
 
-/// Run `git status --short --branch --show-stash` in `path` and return the
-/// output as owned text. Returns `None` if `git` is missing or `path` is not a
-/// repository, so non-repo directories degrade quietly.
-fn git_status_block(path: &Path) -> Option<Text<'static>> {
+/// Parsed git status for a repository path. `None` if `git` is missing or the
+/// path is not inside a work tree.
+struct GitInfo {
+    branch: Option<String>,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    untracked: u32,
+    staged: u32,
+    unstaged: u32,
+    stash: u32,
+    sha: Option<String>,
+    remotes: Vec<(String, String)>,
+}
+
+/// Collect git status + remotes for `path` in two subprocess calls.
+/// Returns `None` if `git` is missing or `path` is not a repository, so non-repo
+/// directories degrade quietly to a tree-only preview.
+fn git_info(path: &Path) -> Option<GitInfo> {
     let path_str = path.to_str()?;
-    let out = Command::new("git")
+    // `--porcelain=v2 --branch` gives branch/upstream/ahead-behind and per-file
+    // staged/unstaged status in a single, stable, machine-readable call.
+    let status_out = Command::new("git")
         .args([
             "-C",
             path_str,
             "status",
-            "--short",
+            "--porcelain=v2",
             "--branch",
             "--show-stash",
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
+    if !status_out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let trimmed = text.trim_end();
-    if trimmed.is_empty() {
-        return None;
+    let status_text = String::from_utf8_lossy(&status_out.stdout);
+
+    let mut info = GitInfo {
+        branch: None,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        untracked: 0,
+        staged: 0,
+        unstaged: 0,
+        stash: 0,
+        sha: None,
+        remotes: vec![],
+    };
+
+    for line in status_text.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            info.branch = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            info.upstream = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
+            info.sha = Some(rest.get(..7).unwrap_or(rest).to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            for tok in rest.split_whitespace() {
+                if let Some(a) = tok.strip_prefix('+') {
+                    info.ahead = a.parse().unwrap_or(0);
+                } else if let Some(b) = tok.strip_prefix('-') {
+                    info.behind = b.parse().unwrap_or(0);
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("# stash ") {
+            info.stash = rest.trim_start_matches('+').parse().unwrap_or(0);
+        } else if line.starts_with("? ") {
+            info.untracked += 1;
+        } else if line.starts_with('1') || line.starts_with('2') || line.starts_with('u') {
+            // Porcelain v2 ordinary/renamed/unmerged: "<kind> <XY> ...".
+            // X = staged status, Y = unstaged status; '.'/' ' means unchanged.
+            let mut parts = line.split_whitespace();
+            parts.next();
+            if let Some(xy) = parts.next() {
+                let mut chars = xy.chars();
+                let x = chars.next().unwrap_or(' ');
+                let y = chars.next().unwrap_or(' ');
+                if x != '.' && x != ' ' {
+                    info.staged += 1;
+                }
+                if y != '.' && y != ' ' {
+                    info.unstaged += 1;
+                }
+            }
+        }
     }
-    Some(Text::from(trimmed.to_string()))
+
+    // Remotes: dedupe by name (fetch/push rows), keep top 3.
+    let remote_out = Command::new("git")
+        .args(["-C", path_str, "remote", "-v"])
+        .output()
+        .ok()?;
+    if remote_out.status.success() {
+        let remote_text = String::from_utf8_lossy(&remote_out.stdout);
+        let mut seen = HashSet::new();
+        for line in remote_text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(name) = parts.next() else { continue };
+            let Some(url) = parts.next() else { continue };
+            if seen.insert(name.to_string()) {
+                info.remotes.push((name.to_string(), url.to_string()));
+                if info.remotes.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(info)
 }
 
-/// Build a depth-limited directory tree as plain text lines. Directories are
-/// listed before files; entries beyond `max_entries` are summarized with a
-/// `… (N more)` line. Symlinks and unreadable entries are skipped quietly.
-fn directory_tree(root: &Path, max_depth: u32, max_entries: usize) -> Vec<Line<'static>> {
+/// Render the fixed git information block as styled lines.
+fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme.overlay0);
     let mut lines = Vec::new();
-    let mut count = 0usize;
-    walk(root, "", 0, max_depth, max_entries, &mut lines, &mut count);
+
+    // Line 1: "git  <branch> ↑N ↓N"
+    let mut head = vec![Span::styled("git  ", dim)];
+    match &info.branch {
+        Some(branch) if branch == "(detached)" => head.push(Span::styled(
+            "(detached)",
+            Style::default().fg(theme.subtext0),
+        )),
+        Some(branch) => head.push(Span::styled(
+            branch.clone(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        None => head.push(Span::styled(
+            "(unknown)",
+            Style::default().fg(theme.subtext0),
+        )),
+    }
+    if info.ahead > 0 {
+        head.push(Span::styled(
+            format!(" ↑{}", info.ahead),
+            Style::default().fg(theme.green),
+        ));
+    }
+    if info.behind > 0 {
+        head.push(Span::styled(
+            format!(" ↓{}", info.behind),
+            Style::default().fg(theme.red),
+        ));
+    }
+    lines.push(Line::from(head));
+
+    // Line 2: compressed change counts, indented under "git  ".
+    let mut parts: Vec<(String, ratatui::style::Color)> = Vec::new();
+    if info.untracked > 0 {
+        parts.push((format!("untracked {}", info.untracked), theme.yellow));
+    }
+    if info.staged > 0 {
+        parts.push((format!("staged {}", info.staged), theme.green));
+    }
+    if info.unstaged > 0 {
+        parts.push((format!("unstaged {}", info.unstaged), theme.peach));
+    }
+    if info.stash > 0 {
+        parts.push((format!("stash {}", info.stash), theme.subtext0));
+    }
+    if !parts.is_empty() {
+        let mut spans = vec![Span::raw("     ")];
+        for (i, (text, color)) in parts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", dim));
+            }
+            spans.push(Span::styled(text.clone(), Style::default().fg(*color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Line 3: current position — short SHA and upstream reference.
+    let mut pos = vec![Span::raw("     ")];
+    if let Some(sha) = &info.sha {
+        pos.push(Span::styled(
+            sha.clone(),
+            Style::default().fg(theme.subtext0),
+        ));
+    }
+    if let Some(up) = &info.upstream {
+        pos.push(Span::styled(" → ", dim));
+        pos.push(Span::styled(up.clone(), Style::default().fg(theme.blue)));
+    }
+    lines.push(Line::from(pos));
+
+    // Remotes: name (padded) + URL, top 3.
+    if !info.remotes.is_empty() {
+        lines.push(Line::from(Span::styled("remotes", dim)));
+        for (name, url) in &info.remotes {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<10}", name), Style::default().fg(theme.blue)),
+                Span::styled(url.clone(), Style::default().fg(theme.subtext0)),
+            ]));
+        }
+    }
+
+    lines
+}
+
+/// Build a depth-limited, colored directory tree. Directories are listed before
+/// files; at most `max_per_level` entries are shown per directory, with a
+/// `… (N more)` summary line for the rest. Symlinks and unreadable entries are
+/// skipped quietly.
+fn directory_tree(
+    root: &Path,
+    max_depth: u32,
+    max_per_level: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    walk(root, "", 0, max_depth, max_per_level, theme, &mut lines);
     lines
 }
 
@@ -164,9 +358,9 @@ fn walk(
     prefix: &str,
     depth: u32,
     max_depth: u32,
-    max_entries: usize,
+    max_per_level: usize,
+    theme: &Theme,
     lines: &mut Vec<Line<'static>>,
-    count: &mut usize,
 ) {
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -184,21 +378,20 @@ fn walk(
     entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
     let total = entries.len();
-    for (i, (name, path, is_dir)) in entries.iter().enumerate() {
-        if *count >= max_entries {
-            lines.push(Line::from(Span::raw(format!(
-                "… ({} more)",
-                total.saturating_sub(i)
-            ))));
-            return;
-        }
-        *count += 1;
-        let last = i + 1 == total;
+    let shown: Vec<&(String, PathBuf, bool)> = entries.iter().take(max_per_level).collect();
+    let has_more = total > max_per_level;
+
+    for (i, (name, path, is_dir)) in shown.iter().enumerate() {
+        let last = i + 1 == shown.len() && !has_more;
         let marker = if last { "└── " } else { "├── " };
+        let marker_span = Span::styled(
+            format!("{prefix}{marker}"),
+            Style::default().fg(theme.overlay0),
+        );
+        let name_color = if *is_dir { theme.blue } else { theme.text };
         let suffix = if *is_dir { "/" } else { "" };
-        lines.push(Line::from(Span::raw(format!(
-            "{prefix}{marker}{name}{suffix}"
-        ))));
+        let name_span = Span::styled(format!("{name}{suffix}"), Style::default().fg(name_color));
+        lines.push(Line::from(vec![marker_span, name_span]));
 
         if *is_dir && depth + 1 < max_depth {
             let child_prefix = if last {
@@ -211,11 +404,21 @@ fn walk(
                 &child_prefix,
                 depth + 1,
                 max_depth,
-                max_entries,
+                max_per_level,
+                theme,
                 lines,
-                count,
             );
         }
+    }
+    if has_more {
+        let more = total - max_per_level;
+        lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}└── "), Style::default().fg(theme.overlay0)),
+            Span::styled(
+                format!("… ({} more)", more),
+                Style::default().fg(theme.subtext0),
+            ),
+        ]));
     }
 }
 
@@ -223,6 +426,10 @@ fn walk(
 mod tests {
     use super::*;
     use std::sync::OnceLock;
+
+    fn theme() -> Theme {
+        Theme::load(None, None, false)
+    }
 
     fn entry(source: Source, path: &str, title: &str) -> Entry {
         Entry {
@@ -244,7 +451,7 @@ mod tests {
     #[test]
     fn header_lists_type_title_and_path() {
         let e = entry(Source::Zoxide, "/tmp/dir", "dir");
-        let text = build_preview(&e, &Config::default());
+        let text = build_preview(&e, &Config::default(), &theme());
         let joined: String = text
             .lines
             .iter()
@@ -263,13 +470,12 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         std::fs::write(dir.join("b.txt"), "y").unwrap();
 
-        let tree = directory_tree(&dir, 2, 40);
+        let tree = directory_tree(&dir, 2, 40, &theme());
         let joined: String = tree
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Directories first: sub/ before a.txt and b.txt.
         assert!(joined.contains("sub/"));
         assert!(joined.contains("a.txt"));
         assert!(joined.contains("b.txt"));
@@ -279,13 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn directory_tree_respects_max_entries() {
+    fn directory_tree_respects_max_per_level() {
         let dir = std::env::temp_dir().join(format!("nav-tree-cap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..5 {
             std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
         }
-        let tree = directory_tree(&dir, 2, 2);
+        let tree = directory_tree(&dir, 2, 2, &theme());
         let joined: String = tree
             .iter()
             .map(|l| l.to_string())
@@ -300,24 +506,125 @@ mod tests {
     fn directory_tree_empty_dir_yields_no_lines() {
         let dir = std::env::temp_dir().join(format!("nav-tree-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tree = directory_tree(&dir, 2, 40);
+        let tree = directory_tree(&dir, 2, 40, &theme());
         assert!(tree.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn git_status_block_returns_none_for_non_repo() {
+    fn git_info_returns_none_for_non_repo() {
         let dir = std::env::temp_dir().join(format!("nav-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(git_status_block(&dir).is_none());
+        assert!(git_info(&dir).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_info_parses_porcelain_v2_branch_and_counts() {
+        let sample = "\
+# branch.oid 4abc1234567890abcdef1234567890abcdef12
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +2 -1
+# stash 3
+1 .M N... 100644 100644 sha1 sha2 modified.txt
+1 M. N... 100644 100644 sha1 sha2 staged.txt
+? untracked.txt
+";
+        let mut info = GitInfo {
+            branch: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: None,
+            remotes: vec![],
+        };
+        for line in sample.lines() {
+            if let Some(rest) = line.strip_prefix("# branch.head ") {
+                info.branch = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+                info.upstream = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
+                info.sha = Some(rest.get(..7).unwrap_or(rest).to_string());
+            } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+                for tok in rest.split_whitespace() {
+                    if let Some(a) = tok.strip_prefix('+') {
+                        info.ahead = a.parse().unwrap_or(0);
+                    } else if let Some(b) = tok.strip_prefix('-') {
+                        info.behind = b.parse().unwrap_or(0);
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("# stash ") {
+                info.stash = rest.trim_start_matches('+').parse().unwrap_or(0);
+            } else if line.starts_with("? ") {
+                info.untracked += 1;
+            } else if line.starts_with('1') || line.starts_with('2') || line.starts_with('u') {
+                let mut parts = line.split_whitespace();
+                parts.next();
+                if let Some(xy) = parts.next() {
+                    let mut chars = xy.chars();
+                    let x = chars.next().unwrap_or(' ');
+                    let y = chars.next().unwrap_or(' ');
+                    if x != '.' && x != ' ' {
+                        info.staged += 1;
+                    }
+                    if y != '.' && y != ' ' {
+                        info.unstaged += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(info.ahead, 2);
+        assert_eq!(info.behind, 1);
+        assert_eq!(info.stash, 3);
+        assert_eq!(info.untracked, 1);
+        assert_eq!(info.staged, 1); // "M." -> staged
+        assert_eq!(info.unstaged, 1); // ".M" -> unstaged
+        assert_eq!(info.sha.as_deref(), Some("4abc123"));
+    }
+
+    #[test]
+    fn render_git_info_shows_branch_ahead_behind_and_counts() {
+        let info = GitInfo {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: 2,
+            behind: 1,
+            untracked: 3,
+            staged: 5,
+            unstaged: 2,
+            stash: 1,
+            sha: Some("abc1234".into()),
+            remotes: vec![("origin".into(), "git@github.com:foo/bar.git".into())],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("main"));
+        assert!(joined.contains("↑2"));
+        assert!(joined.contains("↓1"));
+        assert!(joined.contains("untracked 3"));
+        assert!(joined.contains("staged 5"));
+        assert!(joined.contains("unstaged 2"));
+        assert!(joined.contains("stash 1"));
+        assert!(joined.contains("abc1234"));
+        assert!(joined.contains("origin/main"));
+        assert!(joined.contains("remotes"));
+        assert!(joined.contains("git@github.com:foo/bar.git"));
     }
 
     #[test]
     fn pane_id_for_entry_returns_none_without_workspace_or_agent() {
         let e = entry(Source::Workspace, "/tmp", "x");
-        // No workspace_id and no agent_target -> None (no Herdr call needed to
-        // know it cannot resolve).
         assert!(pane_id_for_entry(&e).is_none());
     }
 }
