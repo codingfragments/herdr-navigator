@@ -15,6 +15,9 @@ pub(crate) enum Command {
     MoveDown,
     PageUp,
     PageDown,
+    Expand,
+    Collapse,
+    ToggleExpand,
     StartSearch,
     CycleFilter,
     DeleteChar,
@@ -104,6 +107,9 @@ impl Keybind {
             Command::ToggleMark => app
                 .selected_entry()
                 .is_some_and(|entry| app.is_pinned(entry)),
+            Command::ToggleExpand => app.selected_is_expandable(),
+            Command::Expand => app.selected_is_expandable() && !app.selected_is_expanded(),
+            Command::Collapse => app.selected_is_expanded(),
             Command::TogglePreview => app.preview,
             Command::ToggleHelp => app.input_mode == InputMode::Help,
             Command::Filter(source) => app.source_filter.as_ref() == Some(source),
@@ -221,6 +227,27 @@ pub(crate) fn keybindings(app: &App) -> Vec<Keybind> {
             Command::PageDown,
             vec![key(KeyCode::PageDown, KeyModifiers::NONE, "PgDn")],
             "page down",
+            "Navigation",
+            None,
+        ),
+        binding(
+            Command::Expand,
+            vec![key(KeyCode::Right, KeyModifiers::NONE, "→")],
+            "expand / enter layer",
+            "Navigation",
+            None,
+        ),
+        binding(
+            Command::Collapse,
+            vec![key(KeyCode::Left, KeyModifiers::NONE, "←")],
+            "collapse / go back",
+            "Navigation",
+            None,
+        ),
+        binding(
+            Command::ToggleExpand,
+            vec![key(KeyCode::Char(' '), KeyModifiers::NONE, "Space")],
+            "expand / collapse",
             "Navigation",
             None,
         ),
@@ -363,6 +390,8 @@ fn source_help_label(source: &Source) -> &'static str {
         Source::Session => "sessions",
         Source::QuickAction => "quick actions",
         Source::Integration => "plugins",
+        Source::Tab => "tabs",
+        Source::Pane => "panes",
     }
 }
 
@@ -377,5 +406,7 @@ fn source_compact_label(source: &Source) -> &'static str {
         Source::Session => "session",
         Source::QuickAction => "quick",
         Source::Integration => "plugin",
+        Source::Tab => "tab",
+        Source::Pane => "pane",
     }
 }

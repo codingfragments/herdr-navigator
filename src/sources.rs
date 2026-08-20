@@ -107,6 +107,7 @@ fn workspaces_from_json(
                 action: EntryAction::FocusWorkspace { id: id.into() },
                 source_label: None,
                 search_terms,
+                parent_id: None,
                 canonical: OnceLock::new(),
             });
         }
@@ -198,6 +199,7 @@ fn agents_from_json(
                 },
                 source_label: None,
                 search_terms,
+                parent_id: None,
                 canonical: OnceLock::new(),
             });
         }
@@ -268,6 +270,7 @@ pub(crate) fn collect_zoxide() -> Vec<Entry> {
                 action: EntryAction::FocusOrCreateDir,
                 source_label: None,
                 search_terms: vec![],
+                parent_id: None,
                 canonical: OnceLock::new(),
             }
         })
@@ -301,6 +304,7 @@ fn walk_dirs(path: &Path, depth: usize, out: &mut Vec<Entry>) {
             action: EntryAction::FocusOrCreateDir,
             source_label: None,
             search_terms: vec![],
+            parent_id: None,
             canonical: OnceLock::new(),
         });
     }

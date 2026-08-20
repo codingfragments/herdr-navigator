@@ -117,6 +117,9 @@ impl SourcesConfig {
             Source::Session => self.sessions,
             Source::QuickAction => self.herdr_plus_quick_actions,
             Source::Integration => true,
+            // Tree children are always available; they appear when their
+            // parent workspace/tab is expanded.
+            Source::Tab | Source::Pane => true,
         }
     }
 }
@@ -237,6 +240,8 @@ fn default_filter_key(source: &Source) -> Option<char> {
         Source::Root => Some('r'),
         Source::Session => Some('l'),
         Source::Integration => None,
+        // Tree children have no filter key; they're reached by expansion.
+        Source::Tab | Source::Pane => None,
     }
 }
 
