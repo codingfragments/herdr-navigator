@@ -148,6 +148,10 @@ struct GitInfo {
     unstaged: u32,
     stash: u32,
     sha: Option<String>,
+    /// Human-friendly name for HEAD from `git describe --tags --always`: a tag
+    /// (`v1.2.3`), a tag-relative describe (`v1.2.3-5-gabc1234`), or the short
+    /// SHA when no tags reach HEAD. Shown as the position alias when available.
+    describe: Option<String>,
     remotes: Vec<(String, String)>,
 }
 
@@ -184,6 +188,7 @@ fn git_info(path: &Path) -> Option<GitInfo> {
         unstaged: 0,
         stash: 0,
         sha: None,
+        describe: None,
         remotes: vec![],
     };
 
@@ -221,6 +226,22 @@ fn git_info(path: &Path) -> Option<GitInfo> {
                 if y != '.' && y != ' ' {
                     info.unstaged += 1;
                 }
+            }
+        }
+    }
+
+    // Human-friendly HEAD alias: tag, tag-relative describe, or short SHA.
+    // `--always` makes it fall back to the SHA when no tags reach HEAD; `--tags`
+    // considers lightweight tags too. Failure here is non-fatal.
+    let describe_out = Command::new("git")
+        .args(["-C", path_str, "describe", "--tags", "--always"])
+        .output()
+        .ok();
+    if let Some(out) = describe_out {
+        if out.status.success() {
+            let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !d.is_empty() {
+                info.describe = Some(d);
             }
         }
     }
@@ -311,13 +332,25 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
 
-    // Line 3: current position — short SHA and upstream reference.
+    // Line 3: current position — prefer a human-friendly alias (tag or
+    // tag-relative describe from `git describe --tags --always`) over the raw
+    // short SHA. Show the SHA as a fallback when no describe is available.
     let mut pos = vec![Span::raw("     ")];
-    if let Some(sha) = &info.sha {
-        pos.push(Span::styled(
-            sha.clone(),
-            Style::default().fg(theme.subtext0),
-        ));
+    let position = info.describe.as_deref().or(info.sha.as_deref());
+    if let Some(p) = position {
+        // If the alias is a tag or tag-relative describe (contains 'g' hex
+        // suffix or is a pure tag), color it as the accent; a bare SHA stays
+        // subtext0.
+        let is_alias = info
+            .describe
+            .as_deref()
+            .is_some_and(|d| d != info.sha.as_deref().unwrap_or(""));
+        let color = if is_alias {
+            theme.mauve
+        } else {
+            theme.subtext0
+        };
+        pos.push(Span::styled(p.to_string(), Style::default().fg(color)));
     }
     if let Some(up) = &info.upstream {
         pos.push(Span::styled(" → ", dim));
@@ -607,6 +640,7 @@ mod tests {
             unstaged: 0,
             stash: 0,
             sha: None,
+            describe: None,
             remotes: vec![],
         };
         for line in sample.lines() {
@@ -667,6 +701,7 @@ mod tests {
             unstaged: 2,
             stash: 1,
             sha: Some("abc1234".into()),
+            describe: None,
             remotes: vec![("origin".into(), "git@github.com:foo/bar.git".into())],
         };
         let lines = render_git_info(&info, &theme());
@@ -686,6 +721,86 @@ mod tests {
         assert!(joined.contains("origin/main"));
         assert!(joined.contains("remotes"));
         assert!(joined.contains("git@github.com:foo/bar.git"));
+    }
+
+    #[test]
+    fn render_git_info_prefers_tag_alias_for_position() {
+        // HEAD is exactly at tag v1.2.3; describe returns the tag name.
+        let info = GitInfo {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: 0,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: Some("abc1234".into()),
+            describe: Some("v1.2.3".into()),
+            remotes: vec![],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("v1.2.3"));
+        assert!(joined.contains("origin/main"));
+        // The bare SHA should not appear when a tag alias is present.
+        assert!(!joined.contains("abc1234"));
+    }
+
+    #[test]
+    fn render_git_info_shows_tag_relative_describe() {
+        // HEAD is 5 commits ahead of tag v1.2.3.
+        let info = GitInfo {
+            branch: Some("main".into()),
+            upstream: None,
+            ahead: 5,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: Some("abc1234".into()),
+            describe: Some("v1.2.3-5-gabc1234".into()),
+            remotes: vec![],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("v1.2.3-5-gabc1234"));
+        assert!(joined.contains("↑5"));
+    }
+
+    #[test]
+    fn render_git_info_falls_back_to_sha_when_no_tags() {
+        // No tags reach HEAD; describe falls back to the short SHA.
+        let info = GitInfo {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: 0,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: Some("abc1234".into()),
+            describe: Some("abc1234".into()),
+            remotes: vec![],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // SHA is shown as the position when describe equals the SHA.
+        assert!(joined.contains("abc1234"));
     }
 
     #[test]
