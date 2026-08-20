@@ -716,7 +716,10 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) -> ListHits {
     for (row, idx) in app.filtered.iter().enumerate() {
         let e = app.get_entry(*idx).expect("filtered index must resolve");
         let color = source_color(&app.theme, &e.source);
-        let is_child = *idx >= app.entries.len();
+        // In search mode, flat pane entries are top-level search results and
+        // should get their own group headers. In tree mode, children are
+        // indented under their parent and never get headers.
+        let is_child = *idx >= app.entries.len() && !app.search_fetched;
         let group_start = if is_child {
             false
         } else {

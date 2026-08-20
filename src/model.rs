@@ -34,7 +34,7 @@ impl Source {
             Source::QuickAction => "quick",
             Source::Integration => "plugin",
             Source::Tab => "tab",
-            Source::Pane => "pane",
+            Source::Pane => "panes",
         }
     }
 
