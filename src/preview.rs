@@ -150,8 +150,11 @@ struct GitInfo {
     sha: Option<String>,
     /// Human-friendly name for HEAD from `git describe --tags --always`: a tag
     /// (`v1.2.3`), a tag-relative describe (`v1.2.3-5-gabc1234`), or the short
-    /// SHA when no tags reach HEAD. Shown as the position alias when available.
+    /// SHA when no tags reach HEAD.
     describe: Option<String>,
+    /// Ref decoration for HEAD from `git log -1 --pretty=format:%D`, e.g.
+    /// `HEAD -> master, origin/master, origin/HEAD`. Shown as the position line.
+    refs: Option<String>,
     remotes: Vec<(String, String)>,
 }
 
@@ -189,6 +192,7 @@ fn git_info(path: &Path) -> Option<GitInfo> {
         stash: 0,
         sha: None,
         describe: None,
+        refs: None,
         remotes: vec![],
     };
 
@@ -246,6 +250,21 @@ fn git_info(path: &Path) -> Option<GitInfo> {
             let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !d.is_empty() {
                 info.describe = Some(d);
+            }
+        }
+    }
+
+    // Ref decoration for HEAD (e.g. `HEAD -> master, origin/master, origin/HEAD`),
+    // the same line `git log -1` shows. Used as the position line.
+    let refs_out = Command::new("git")
+        .args(["-C", path_str, "log", "-1", "--pretty=format:%D"])
+        .output()
+        .ok();
+    if let Some(out) = refs_out {
+        if out.status.success() {
+            let r = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !r.is_empty() {
+                info.refs = Some(r);
             }
         }
     }
@@ -336,24 +355,39 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
 
-    // Line 3: current position — prefer a human-friendly alias (tag or
-    // tag-relative describe from `git describe --tags --always`) over the raw
-    // short SHA. Show the SHA as a fallback when no describe is available.
+    // Line 3: current position — the ref decoration for HEAD, the same line
+    // `git log -1` shows (e.g. `HEAD -> master, origin/master, origin/HEAD`).
+    // `HEAD ->` and the local branch are accent; remote/other refs are blue.
     let mut pos = vec![Span::raw("     ")];
-    // Label this as HEAD's position so it's unambiguous what the alias/SHA
-    // refers to (matches `git log -1`'s `HEAD -> branch` framing).
-    pos.push(Span::styled(
-        "HEAD",
-        Style::default()
-            .fg(theme.green)
-            .add_modifier(Modifier::BOLD),
-    ));
-    pos.push(Span::raw(" "));
-    let position = info.describe.as_deref().or(info.sha.as_deref());
-    if let Some(p) = position {
-        // If the alias is a tag or tag-relative describe (contains 'g' hex
-        // suffix or is a pure tag), color it as the accent; a bare SHA stays
-        // subtext0.
+    if let Some(refs) = &info.refs {
+        let mut first = true;
+        for part in refs.split(", ") {
+            if !first {
+                pos.push(Span::raw(", "));
+            }
+            first = false;
+            if let Some(branch) = part.strip_prefix("HEAD -> ") {
+                pos.push(Span::styled(
+                    "HEAD -> ".to_string(),
+                    Style::default()
+                        .fg(theme.green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                pos.push(Span::styled(
+                    branch.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                pos.push(Span::styled(
+                    part.to_string(),
+                    Style::default().fg(theme.blue),
+                ));
+            }
+        }
+    } else if let Some(p) = info.describe.as_deref().or(info.sha.as_deref()) {
+        // Fallback when %D is unavailable: describe alias or short SHA.
         let is_alias = info
             .describe
             .as_deref()
@@ -370,10 +404,6 @@ fn render_git_info(info: &GitInfo, theme: &Theme) -> Vec<Line<'static>> {
             "(no commits)",
             Style::default().fg(theme.subtext0),
         ));
-    }
-    if let Some(up) = &info.upstream {
-        pos.push(Span::styled(" → ", dim));
-        pos.push(Span::styled(up.clone(), Style::default().fg(theme.blue)));
     }
     lines.push(Line::from(pos));
 
@@ -660,6 +690,7 @@ mod tests {
             stash: 0,
             sha: None,
             describe: None,
+            refs: None,
             remotes: vec![],
         };
         for line in sample.lines() {
@@ -721,6 +752,7 @@ mod tests {
             stash: 1,
             sha: Some("abc1234".into()),
             describe: None,
+            refs: Some("HEAD -> main, origin/main, origin/HEAD".into()),
             remotes: vec![("origin".into(), "git@github.com:foo/bar.git".into())],
         };
         let lines = render_git_info(&info, &theme());
@@ -736,9 +768,9 @@ mod tests {
         assert!(joined.contains("staged 5"));
         assert!(joined.contains("unstaged 2"));
         assert!(joined.contains("stash 1"));
-        assert!(joined.contains("HEAD"));
-        assert!(joined.contains("abc1234"));
+        assert!(joined.contains("HEAD -> main"));
         assert!(joined.contains("origin/main"));
+        assert!(joined.contains("origin/HEAD"));
         assert!(joined.contains("remotes"));
         assert!(joined.contains("git@github.com:foo/bar.git"));
     }
@@ -757,6 +789,7 @@ mod tests {
             stash: 0,
             sha: Some("abc1234".into()),
             describe: Some("v1.2.3".into()),
+            refs: None,
             remotes: vec![],
         };
         let lines = render_git_info(&info, &theme());
@@ -765,9 +798,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // No refs decoration -> falls back to the describe alias.
         assert!(joined.contains("v1.2.3"));
-        assert!(joined.contains("HEAD"));
-        assert!(joined.contains("origin/main"));
         // The bare SHA should not appear when a tag alias is present.
         assert!(!joined.contains("abc1234"));
     }
@@ -786,6 +818,7 @@ mod tests {
             stash: 0,
             sha: Some("abc1234".into()),
             describe: Some("v1.2.3-5-gabc1234".into()),
+            refs: None,
             remotes: vec![],
         };
         let lines = render_git_info(&info, &theme());
@@ -795,7 +828,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("v1.2.3-5-gabc1234"));
-        assert!(joined.contains("HEAD"));
         assert!(joined.contains("↑5"));
     }
 
@@ -813,6 +845,7 @@ mod tests {
             stash: 0,
             sha: Some("abc1234".into()),
             describe: Some("abc1234".into()),
+            refs: None,
             remotes: vec![],
         };
         let lines = render_git_info(&info, &theme());
@@ -823,7 +856,6 @@ mod tests {
             .join("\n");
         // SHA is shown as the position when describe equals the SHA.
         assert!(joined.contains("abc1234"));
-        assert!(joined.contains("HEAD"));
     }
 
     #[test]
@@ -840,6 +872,7 @@ mod tests {
             stash: 0,
             sha: None,
             describe: None,
+            refs: None,
             remotes: vec![],
         };
         let lines = render_git_info(&info, &theme());
@@ -849,9 +882,41 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("(no commits)"));
-        assert!(joined.contains("HEAD"));
         // Should not show a garbage SHA like "(initia".
         assert!(!joined.contains("(initia"));
+    }
+
+    #[test]
+    fn render_git_info_shows_refs_decoration_for_position() {
+        // Real-world case: HEAD on master with origin/master and origin/HEAD.
+        let info = GitInfo {
+            branch: Some("master".into()),
+            upstream: Some("origin/master".into()),
+            ahead: 0,
+            behind: 0,
+            untracked: 0,
+            staged: 0,
+            unstaged: 0,
+            stash: 0,
+            sha: Some("4bef8d2".into()),
+            describe: Some("v0.8-461-g4bef8d2".into()),
+            refs: Some("HEAD -> master, origin/master, origin/HEAD".into()),
+            remotes: vec![],
+        };
+        let lines = render_git_info(&info, &theme());
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The refs decoration line is shown verbatim, like `git log -1`.
+        assert!(joined.contains("HEAD -> master"));
+        assert!(joined.contains("origin/master"));
+        assert!(joined.contains("origin/HEAD"));
+        // When refs are present, the describe alias and bare SHA are not shown
+        // as the position (they'd be redundant).
+        assert!(!joined.contains("v0.8-461-g4bef8d2"));
+        assert!(!joined.contains("4bef8d2"));
     }
 
     #[test]
