@@ -861,11 +861,14 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) -> ListHits {
     }
 }
 
-fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
+fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let text = if let Some(e) = app.selected_entry() {
-        preview_text(app, e)
+        match e.source {
+            Source::Agent | Source::Workspace | Source::Zoxide | Source::Root => app.rich_preview(),
+            _ => ratatui::text::Text::raw(preview_text(app, e)),
+        }
     } else {
-        "No results".into()
+        ratatui::text::Text::raw("No results")
     };
     let p = Paragraph::new(text)
         .style(Style::default().fg(app.theme.text))

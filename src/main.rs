@@ -12,6 +12,7 @@ mod matcher;
 mod model;
 mod navigator_state;
 mod paths;
+mod preview;
 mod sources;
 mod theme;
 mod tui;

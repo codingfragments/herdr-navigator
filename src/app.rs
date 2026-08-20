@@ -50,6 +50,8 @@ pub(crate) struct App {
     pub(crate) spinner_tick: u32,
     pub(crate) update_available: Option<String>,
     pub(crate) list_height: u16,
+    pub(crate) preview_cache_key: Option<String>,
+    pub(crate) preview_cache: Option<ratatui::text::Text<'static>>,
 }
 
 impl App {
@@ -73,10 +75,16 @@ impl App {
             spinner_tick: 0,
             update_available: None,
             list_height: 0,
+            preview_cache_key: None,
+            preview_cache: None,
         }
     }
 
     pub(crate) fn refresh(&mut self) {
+        // Sources may have changed (workspaces opened/closed, agents moved),
+        // so any cached rich preview is potentially stale.
+        self.preview_cache_key = None;
+        self.preview_cache = None;
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
         let (workspace_entries, path_to_workspaces, migrated_legacy, has_live_workspace_list) =
@@ -275,6 +283,27 @@ impl App {
         self.filtered
             .get(self.selected)
             .and_then(|idx| self.entries.get(*idx))
+    }
+
+    /// Return the rich preview for the currently selected entry, computing
+    /// and caching it when the selection changes. Cloning the cached `Text`
+    /// each render is cheap; the expensive work (Herdr pane read, `git status`,
+    /// ANSI parsing) only runs once per selected entry.
+    pub(crate) fn rich_preview(&mut self) -> ratatui::text::Text<'static> {
+        let key = self.selected_entry().map(|e| e.key().to_string());
+        if key == self.preview_cache_key {
+            if let Some(text) = &self.preview_cache {
+                return text.clone();
+            }
+        }
+        let entry = self.selected_entry().cloned();
+        let text = match entry {
+            Some(e) => crate::preview::build_preview(&e, &self.config),
+            None => ratatui::text::Text::raw("No results"),
+        };
+        self.preview_cache_key = key;
+        self.preview_cache = Some(text.clone());
+        text
     }
 
     pub(crate) fn is_pinned(&self, entry: &Entry) -> bool {

@@ -244,6 +244,9 @@ source_order = ["workspace", "agent", "project", "session", "zoxide", "root", "s
 source_priority_boost = 5
 agent_sort = "herdr" # herdr | priority | spaces
 preview = true
+preview_scrollback_lines = 200 # pane scrollback lines shown for agents/workspaces
+preview_tree_depth = 2 # max depth of the directory tree for zoxide/root
+preview_git_status = true # show `git status` block for repo directories
 detailed_rows = true # source-aware Herdr-style result rows
 check_updates = true # daily background release check
 # directory_template = "default.toml" # Herdr Plus project file
@@ -283,6 +286,7 @@ max_depth = 3
 Useful config surfaces:
 
 - `picker.detailed_rows` enables source-aware rows: right-aligned metadata for most sources and a full-path second line only for zoxide/root.
+- `picker.preview` toggles the right-side preview pane (`Ctrl-O` at runtime). The preview is source-aware: agents and workspaces show the pane's recent scrollback buffer (ANSI colors preserved), and zoxide/root entries show a depth-limited directory tree prefixed with a `git status` block when the path is inside a git repository. `preview_scrollback_lines` (default 200), `preview_tree_depth` (default 2), and `preview_git_status` (default true) tune the rich preview; the work is cached per selection so it runs once when you land on an entry, not every frame.
 - `picker.check_updates` checks GitHub releases in the background at most daily and shows `↑ vX.Y.Z available · F5 update`; press `F5`, confirm, and Navigator installs that release through Herdr. Failures stay silent until an update is requested.
 - `picker.prefix_workspace_labels` defaults to `true` and prefixes newly created workspace labels with `project:` or `dir:`. Set it to `false` for plain labels; Navigator still persists the workspace kind.
 - `picker.directory_template = "default.toml"` reuses that Herdr Plus project file from its `projects/` config directory. `Enter` keeps normal reuse/create behavior. `picker.directory_template_key` defaults to `alt-enter` and also accepts Ctrl forms such as `ctrl-g`; the shortcut always applies all template tabs, panes, labels, and commands using the selected directory instead of the template's `working_dir`, creating the workspace or appending fresh template tabs.
