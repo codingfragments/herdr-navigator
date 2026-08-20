@@ -845,4 +845,25 @@ mod tests {
         let e = entry(Source::Workspace, "/tmp", "x");
         assert!(pane_id_for_entry(&e).is_none());
     }
+
+    /// Real-world check against the user's `~/.dotfiles` repo. Ignored by
+    /// default; run with `cargo test -- --ignored` to confirm HEAD resolves.
+    #[test]
+    #[ignore]
+    fn git_info_resolves_head_on_real_dotfiles() {
+        let home = std::env::var("HOME").unwrap();
+        let dotfiles = format!("{home}/.dotfiles");
+        if !Path::new(&dotfiles).is_dir() {
+            eprintln!("skipped: {dotfiles} not present");
+            return;
+        }
+        let info = git_info(Path::new(&dotfiles)).expect("git_info should resolve on ~/.dotfiles");
+        assert!(info.sha.is_some(), "sha should resolve");
+        assert!(info.describe.is_some(), "describe should resolve");
+        assert_eq!(info.branch.as_deref(), Some("master"));
+        eprintln!(
+            "sha={:?} describe={:?} branch={:?}",
+            info.sha, info.describe, info.branch
+        );
+    }
 }
